@@ -20,8 +20,8 @@ const PROOF_CH = process.env.PROOF_CHANNEL_ID
   ? +process.env.PROOF_CHANNEL_ID
   : null;
 
-// 👇 NEW: optional open-link button for proofs channel
-const PROOF_URL = process.env.PROOF_CHANNEL_URL || null;
+// ✅ NEW (optional): show “Proofs” button if URL is set
+const PROOF_CH_URL = process.env.PROOF_CHANNEL_URL || "";
 
 const BONUS_PER_DAY = +(process.env.BONUS_PER_DAY || 10);
 const REF_BONUS = +(process.env.REF_BONUS || 20);
@@ -82,14 +82,20 @@ const TG = {
   },
 };
 
-// ⬇️ SAME keyboard as before, only added the optional “📄 Proofs” row.
-const MAIN_KB = TG.kb([
+// ✅ MAIN_KB (unchanged text/flow) + optional Proofs row
+const mainRows = [
   [{ text: "💰 Balance", callback_data: "bal" }, { text: "🎁 Daily Bonus", callback_data: "bonus" }],
   [{ text: "👥 Referral", callback_data: "ref" }, { text: "💵 Withdraw", callback_data: "wd" }],
-  [{ text: "🏆 Leaderboard", callback_data: "lb" }],
-  ...(PROOF_URL ? [[{ text: "📄 Proofs", url: PROOF_URL }]] : []),
-  ...(ADMINS.length ? [[{ text: "🛠 Admin Panel", callback_data: "ad" }]] : []),
-]);
+];
+
+if (PROOF_CH_URL) {
+  mainRows.push([{ text: "📄 Proofs", url: PROOF_CH_URL }]);
+}
+
+mainRows.push([{ text: "🏆 Leaderboard", callback_data: "lb" }]);
+if (ADMINS.length) mainRows.push([{ text: "🛠 Admin Panel", callback_data: "ad" }]);
+
+const MAIN_KB = TG.kb(mainRows);
 
 const BACK_KB = TG.kb([[{ text: "◀️ Back", callback_data: "back" }]]);
 
