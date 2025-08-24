@@ -20,9 +20,8 @@ const PROOF_CH = process.env.PROOF_CHANNEL_ID
   ? +process.env.PROOF_CHANNEL_ID
   : null;
 
-/* 👇 NEW: optional username for proof channel; and unified target */
-const PROOF_CH_UN = process.env.PROOF_CHANNEL_USERNAME || null; // e.g. @Withdrawal_Proofsj
-const PROOF_TARGET = PROOF_CH || PROOF_CH_UN || null;
+// 👇 NEW: optional open-link button for proofs channel
+const PROOF_URL = process.env.PROOF_CHANNEL_URL || null;
 
 const BONUS_PER_DAY = +(process.env.BONUS_PER_DAY || 10);
 const REF_BONUS = +(process.env.REF_BONUS || 20);
@@ -83,18 +82,12 @@ const TG = {
   },
 };
 
-/* 👇 NEW: bot username resolver (referral link fix) */
-const BOT_USERNAME_ENV = (process.env.BOT_USERNAME || "").replace("@", "");
-async function getBotUsername() {
-  if (BOT_USERNAME_ENV) return BOT_USERNAME_ENV;
-  const info = await fetch(`${TG_API}/getMe`).then(r=>r.json()).catch(()=>null);
-  return info?.result?.username || "";
-}
-
+// ⬇️ SAME keyboard as before, only added the optional “📄 Proofs” row.
 const MAIN_KB = TG.kb([
   [{ text: "💰 Balance", callback_data: "bal" }, { text: "🎁 Daily Bonus", callback_data: "bonus" }],
   [{ text: "👥 Referral", callback_data: "ref" }, { text: "💵 Withdraw", callback_data: "wd" }],
   [{ text: "🏆 Leaderboard", callback_data: "lb" }],
+  ...(PROOF_URL ? [[{ text: "📄 Proofs", url: PROOF_URL }]] : []),
   ...(ADMINS.length ? [[{ text: "🛠 Admin Panel", callback_data: "ad" }]] : []),
 ]);
 
@@ -201,16 +194,15 @@ async function onUpdate(upd) {
     if (ok) {
       const dest = wd.kind === "email" ? `email: <b>${esc(wd.value)}</b>` : `UPI: <b>${esc(wd.value)}</b>`;
       await TG.send(wd.user, `🎉 <b>Your withdrawal #${wid} has been APPROVED.</b>\nCheck your ${dest}.`, BACK_KB);
-
-      // 👇 FIXED: post to proof channel (supports ID or @username)
-      if (PROOF_TARGET) {
+      // post to proof channel
+      if (PROOF_CH) {
         const masked = wd.kind === "email" ? maskEmail(wd.value) : maskUPI(wd.value);
         const title = `✅ Withdrawal Paid`;
         const text =
           `<b>${title}</b>\nID: <b>${wid}</b>\nUser: ${uu.name ? esc(uu.name) : uu.id}\n` +
           `${wd.kind === "email" ? `Email: <b>${esc(masked)}</b>` : `UPI: <b>${esc(masked)}</b>`}\n` +
           `Amount: <b>${wd.amount}</b>`;
-        await TG.send(PROOF_TARGET, text);
+        await TG.send(PROOF_CH, text);
       }
     } else {
       await TG.send(wd.user, `❌ <b>Your withdrawal #${wid} was REJECTED.</b>\nAmount refunded.`, BACK_KB);
@@ -293,13 +285,9 @@ async function onUpdate(upd) {
     }
 
     if (data === "ref") {
-      /* 👇 FIXED: referral link using bot username */
-      const uname = await getBotUsername();
-      const link = uname
-        ? `https://t.me/${uname}?start=${from.id}`
-        : `https://t.me/<your_bot_username>?start=${from.id}`;
+      const link = `https://t.me/${(upd?.my_chat_member?.chat?.username) || ""}?start=${from.id}`;
       await TG.edit(chat_id, cb.message.message_id,
-        `👥 <b>Your Referrals:</b> <b>${u.refs}</b>\n🔗 Invite link: <code>${esc(link)}</code>`,
+        `👥 <b>Your Referrals:</b> <b>${u.refs}</b>\n🔗 Invite link: <code>https://t.me/<your_bot_username>?start=${from.id}</code>\n(ऊपर अपने बॉट का यूज़रनेम भरें)`,
         BACK_KB);
       return;
     }
@@ -349,7 +337,7 @@ async function onUpdate(upd) {
   if (m?.text) {
     const txt = m.text.trim();
 
-    // Admin commands (unchanged)
+    // Admin commands
     if (isAdmin(from.id) && /^\/(add|sub)\s+\d+\s+\d+$/.test(txt)) {
       const [, cmd, uidStr, amtStr] = txt.match(/^\/(add|sub)\s+(\d+)\s+(\d+)$/);
       const tgt = await getUser(+uidStr);
