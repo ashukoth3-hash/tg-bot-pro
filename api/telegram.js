@@ -78,13 +78,13 @@ async function rsmembers(key) {
 
 // ===== KEYS =====
 const k = {
-  verified: uid => `verified:${uid}`,
   payload: uid => `payload:${uid}`,
   coins: uid => `coins:${uid}`,
   credited: uid => `credited:${uid}`,
   daily: uid => `daily:${uid}`,
   users: () => `users_all`,
   refCount: uid => `ref:${uid}`,
+  name: uid => `name:${uid}`,
   wseq: () => `w:seq`,
   w: wid => `w:${wid}`,
 };
@@ -131,7 +131,7 @@ async function sendMainMenu(chatId) {
 }
 
 // ===== REFERRAL =====
-async function applyReferral(uid) {
+async function applyReferral(uid, name) {
   const payload = await rget(k.payload(uid));
   if (!payload || !payload.startsWith("ref_")) return;
   const refId = payload.slice(4);
@@ -141,6 +141,7 @@ async function applyReferral(uid) {
   await addCoins(uid, REF_BONUS_NEW);
   await addCoins(refId, REF_BONUS_REF);
   await rincrby(k.refCount(refId), 1);
+  if (name) await rset(k.name(uid), name);
   await rset(k.credited(uid), "1");
 }
 
@@ -168,19 +169,23 @@ function maskUpi(upi) {
 async function handleStart(msg) {
   const chatId = msg.chat.id;
   const uid = msg.from.id;
+  const uname = msg.from.first_name || "User";
   const parts = (msg.text||"").split(" ");
   if (parts[1]) await rset(k.payload(uid), parts[1]);
+
+  // हर बार पहले gate check
   const ok = await isJoinedAll(uid);
   if (!ok) return showJoinGate(chatId);
-  await rset(k.verified(uid),"1");
-  await applyReferral(uid);
+
+  await applyReferral(uid, uname);
+  await rset(k.name(uid), uname);
   return sendMainMenu(chatId);
 }
 async function handleGateClaim(cb) {
   const ok = await isJoinedAll(cb.from.id);
   if (!ok) return showJoinGate(cb.message.chat.id);
-  await rset(k.verified(cb.from.id),"1");
-  await applyReferral(cb.from.id);
+  await applyReferral(cb.from.id, cb.from.first_name);
+  await rset(k.name(cb.from.id), cb.from.first_name);
   await sendMainMenu(cb.message.chat.id);
 }
 
@@ -222,14 +227,15 @@ async function openSection(section, cb) {
     const arr=[];
     for(const u of users){
       const c=Number(await rget(k.refCount(u))||0);
-      arr.push({u,c});
+      const nm=await rget(k.name(u))||u;
+      arr.push({nm,c});
     }
     arr.sort((a,b)=>b.c-a.c);
     const top=arr.slice(0,10);
     let txt="🏆 Leaderboard\n";
     let i=1;
     for(const t of top){
-      txt+=`${i}. ${t.u} - ${t.c} refs\n`;
+      txt+=`${i}. ${t.nm} - ${t.c} refs\n`;
       i++;
     }
     return TG.send(chatId,txt,backKb);
@@ -248,15 +254,8 @@ async function openSection(section, cb) {
 // ===== WITHDRAW FLOW =====
 async function handleWithdrawFlow(cb) {
   const chatId=cb.message.chat.id;
-  const uid=cb.from.id;
-  const data=cb.data;
-
-  if(data==="wd:gmail"){
-    return TG.send(chatId,"Send your Gmail like:\n<code>/gmail yourmail@gmail.com amount</code>",backKb);
-  }
-  if(data==="wd:upi"){
-    return TG.send(chatId,"Send your UPI like:\n<code>/upi upi@okicici amount</code>",backKb);
-  }
+  if(cb.data==="wd:gmail") return TG.send(chatId,"Send Gmail like:\n<code>/gmail yourmail@gmail.com amount</code>",backKb);
+  if(cb.data==="wd:upi") return TG.send(chatId,"Send UPI like:\n<code>/upi upi@okicici amount</code>",backKb);
 }
 
 // ===== WITHDRAW CMD =====
@@ -264,12 +263,11 @@ async function handleWithdrawCmd(msg){
   const chatId=msg.chat.id;
   const uid=msg.from.id;
   const parts=(msg.text||"").trim().split(/\s+/);
+
   if(parts[0]==="/gmail"){
-    if(parts.length<3) return TG.send(chatId,"Usage: /gmail email amount");
     const email=parts[1]; const amt=Number(parts[2]);
-    if(amt<MIN_WITHDRAW) return TG.send(chatId,"Min withdraw "+MIN_WITHDRAW);
     const coins=await getCoins(uid);
-    if(coins<amt) return TG.send(chatId,"Not enough balance");
+    if(coins<amt||amt<MIN_WITHDRAW) return TG.send(chatId,"❌ Not enough balance or below minimum",backKb);
     await addCoins(uid,-amt);
     const wid=await newWithdrawId();
     const req={id:wid,uid,email,upi:null,amt,status:"pending"};
@@ -281,12 +279,11 @@ async function handleWithdrawCmd(msg){
       ]}
     });
   }
+
   if(parts[0]==="/upi"){
-    if(parts.length<3) return TG.send(chatId,"Usage: /upi upi_id amount");
     const upi=parts[1]; const amt=Number(parts[2]);
-    if(amt<MIN_WITHDRAW) return TG.send(chatId,"Min withdraw "+MIN_WITHDRAW);
     const coins=await getCoins(uid);
-    if(coins<amt) return TG.send(chatId,"Not enough balance");
+    if(coins<amt||amt<MIN_WITHDRAW) return TG.send(chatId,"❌ Not enough balance or below minimum",backKb);
     await addCoins(uid,-amt);
     const wid=await newWithdrawId();
     const req={id:wid,uid,email:null,upi,amt,status:"pending"};
@@ -314,7 +311,41 @@ async function onAdminReject(wid){
   if(!w||w.status!=="pending") return;
   w.status="rejected"; await saveWithdraw(wid,w);
   await addCoins(w.uid,w.amt);
-  await TG.send(w.uid,`🚫 Withdraw #${w.id} Rejected. Amount refunded.`);
+  await TG.send(w.uid,`🚫 Withdraw #${w.id} Rejected. Refunded.`);
+}
+
+// ===== ADMIN COMMANDS =====
+async function handleAdminCommands(msg) {
+  if (msg.from.id !== ADMIN_ID) return;
+  const chatId = msg.chat.id;
+  const text = (msg.text||"").trim();
+
+  if(text.startsWith("/add ")){
+    const [,id,amt]=text.split(" ");
+    await addCoins(id,Number(amt));
+    const bal=await getCoins(id);
+    return TG.send(chatId,`Added ${amt} → ${id} balance: ${bal}`);
+  }
+  if(text.startsWith("/deduct ")){
+    const [,id,amt]=text.split(" ");
+    await addCoins(id,-Number(amt));
+    const bal=await getCoins(id);
+    return TG.send(chatId,`Deducted ${amt} → ${id} balance: ${bal}`);
+  }
+  if(text.startsWith("/bal ")){
+    const [,id]=text.split(" ");
+    const bal=await getCoins(id);
+    return TG.send(chatId,`${id} balance: ${bal}`);
+  }
+  if(text.startsWith("/broadcast ")){
+    const message=text.replace("/broadcast ","");
+    const users=await rsmembers(k.users());
+    for(const u of users) await TG.send(u,`📣 ${message}`).catch(()=>{});
+    return TG.send(chatId,`Broadcast sent to ${users.length}`);
+  }
+  if(text.startsWith("/help")){
+    return TG.send(chatId,"Admin commands:\n/add id amt\n/deduct id amt\n/bal id\n/broadcast msg");
+  }
 }
 
 // ===== MAIN HANDLER =====
@@ -327,6 +358,7 @@ export default async function handler(req,res){
 
   if(u.message){
     const m=u.message; const t=m.text||"";
+    if(m.from.id===ADMIN_ID && /^\/(add|deduct|bal|broadcast|help)/.test(t)) await handleAdminCommands(m);
     if(t.startsWith("/start")) await handleStart(m);
     if(t.startsWith("/gmail")||t.startsWith("/upi")) await handleWithdrawCmd(m);
   }
