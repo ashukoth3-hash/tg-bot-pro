@@ -1,81 +1,45 @@
-// api/telegram.js
-// Crash-safe minimal handler to get your route healthy first.
+export const config = { runtime: "edge" };
 
-export default async function handler(req, res) {
-  try {
-    // Simple health endpoint
-    if (req.method === 'GET') {
-      const dbg = (req.query.debug || '').toString().toLowerCase();
-      if (dbg === 'env') {
-        return res.status(200).json({
-          ok: true,
-          BOT_TOKEN: !!process.env.BOT_TOKEN,
-          WEBHOOK_SECRET: !!process.env.WEBHOOK_SECRET,
-          APP_URL: !!process.env.APP_URL,
-          UPSTASH_REDIS_REST_URL: !!process.env.UPSTASH_REDIS_REST_URL,
-          UPSTASH_REDIS_REST_TOKEN: !!process.env.UPSTASH_REDIS_REST_TOKEN,
-        });
-      }
-      return res.status(200).json({ ok: true, hello: 'telegram' });
-    }
-
-    // Telegram webhook hits POST
-    if (req.method === 'POST') {
-      // Hard guard: never crash on bad/missing env/secret
-      const incomingSecret = (req.query.secret || '').toString();
-      const expected = process.env.WEBHOOK_SECRET || '';
-
-      if (!expected) {
-        console.warn('WEBHOOK_SECRET missing in env.');
-        // Still 200 so Telegram stops retrying; plus message tells you the problem
-        return res
-          .status(200)
-          .json({ ok: false, error: 'WEBHOOK_SECRET env missing on server' });
-      }
-      if (incomingSecret !== expected) {
-        console.warn('Bad webhook secret:', { incoming: incomingSecret });
-        return res.status(401).json({ ok: false, error: 'Bad secret' });
-      }
-
-      // Body may come as parsed or raw depending on Vercel; normalize safely
-      const update = typeof req.body === 'object' && req.body
-        ? req.body
-        : await safeReadJSON(req);
-
-      console.log('Incoming update:', JSON.stringify(update).slice(0, 2000));
-
-      // ---- Minimal echo so route stays healthy (no external deps) ----
-      // IMPORTANT: Return 200 fast so Telegram is happy.
-      // (Your full bot logic can be plugged here later.)
-      return res.status(200).json({ ok: true });
-    }
-
-    // Other methods
-    res.setHeader('Allow', 'GET, POST');
-    return res.status(405).json({ ok: false, error: 'Method Not Allowed' });
-  } catch (err) {
-    // Never let the function crash; always return JSON & log the error
-    console.error('Handler error:', err && err.stack ? err.stack : err);
-    return res
-      .status(200)
-      .json({ ok: false, error: 'handler_catch', detail: String(err) });
-  }
+function ok(json) {
+  return new Response(JSON.stringify(json), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
 }
 
-// Safely read JSON body without crashing on empty/invalid payloads
-async function safeReadJSON(req) {
+export default async function handler(req) {
+  // 1) Secret check
+  const url = new URL(req.url);
+  const qsSecret = url.searchParams.get("secret");
+  const envSecret = process.env.WEBHOOK_SECRET || "";
+  if (!qsSecret || qsSecret !== envSecret) {
+    return ok({ ok: true, note: "bad secret, ignoring" });
+  }
+
+  // 2) Parse update
+  let update;
+  try { update = await req.json(); } catch { return ok({ ok: true, note: "no json" }); }
+
+  // 3) Figure out chat
+  const msg = update.message || update.edited_message || update.callback_query?.message;
+  const chatId = msg?.chat?.id;
+  if (!chatId) return ok({ ok: true, note: "no chat id" });
+
+  // 4) Simple reply (for any /start or any text)
+  const BOT_TOKEN = process.env.BOT_TOKEN;
+  const textIn = update.message?.text || update.callback_query?.data || "";
+  const replyText = `👋 Hello! I received: ${textIn || "(no text)"}\n✅ Ping reply OK`;
+
+  // 5) Send message to Telegram
   try {
-    const chunks = [];
-    for await (const c of req) chunks.push(c);
-    const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-    try {
-      return JSON.parse(raw);
-    } catch {
-      console.warn('Invalid JSON body received:', raw.slice(0, 500));
-      return {};
-    }
+    const tg = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text: replyText }),
+    });
+    const data = await tg.json();
+    return ok({ ok: true, sent: data });
   } catch (e) {
-    console.warn('safeReadJSON failed', e);
-    return {};
+    return ok({ ok: false, error: String(e) });
   }
 }
