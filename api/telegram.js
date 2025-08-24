@@ -16,14 +16,15 @@ const CHANNELS = (process.env.CHANNELS || "")
   .map(s => s.trim())
   .filter(Boolean); // e.g. ['@ch1','@ch2']
 
-// ✅ FIX: PROOF_CHANNEL_ID can be numeric (-100...) OR @username
 const PROOF_CH = process.env.PROOF_CHANNEL_ID
-  ? (/^-?\d+$/.test(process.env.PROOF_CHANNEL_ID)
-      ? +process.env.PROOF_CHANNEL_ID
-      : process.env.PROOF_CHANNEL_ID.trim())
+  ? +process.env.PROOF_CHANNEL_ID
   : null;
 
-// ✅ OPTIONAL: menu button to open proofs channel (no effect on posting)
+/* 👇 optional username for proof channel; and unified target */
+const PROOF_CH_UN = process.env.PROOF_CHANNEL_USERNAME || null; // e.g. @Withdrawal_Proofsj
+const PROOF_TARGET = PROOF_CH || PROOF_CH_UN || null;
+
+/* 👇 NEW: URL for button to open proofs channel */
 const PROOF_CH_URL = process.env.PROOF_CHANNEL_URL || "";
 
 const BONUS_PER_DAY = +(process.env.BONUS_PER_DAY || 10);
@@ -85,18 +86,30 @@ const TG = {
   },
 };
 
-/* ===== Main Keyboard (same + optional Proofs row) ===== */
+/* 👇 bot username resolver (referral link fix) */
+const BOT_USERNAME_ENV = (process.env.BOT_USERNAME || "").replace("@", "");
+async function getBotUsername() {
+  if (BOT_USERNAME_ENV) return BOT_USERNAME_ENV;
+  const info = await fetch(`${TG_API}/getMe`).then(r=>r.json()).catch(()=>null);
+  return info?.result?.username || "";
+}
+
+/* ================== Keyboards ================== */
 const mainRows = [
   [{ text: "💰 Balance", callback_data: "bal" }, { text: "🎁 Daily Bonus", callback_data: "bonus" }],
   [{ text: "👥 Referral", callback_data: "ref" }, { text: "💵 Withdraw", callback_data: "wd" }],
 ];
+
+/* 👇 ONLY NEW ROW: Proof channel button via URL */
 if (PROOF_CH_URL) {
-  mainRows.push([{ text: "📄 Proofs", url: PROOF_CH_URL }]); // just opens channel
+  mainRows.push([{ text: "📄 Proofs", url: PROOF_CH_URL }]);
 }
+
 mainRows.push([{ text: "🏆 Leaderboard", callback_data: "lb" }]);
 if (ADMINS.length) mainRows.push([{ text: "🛠 Admin Panel", callback_data: "ad" }]);
 
 const MAIN_KB = TG.kb(mainRows);
+
 const BACK_KB = TG.kb([[{ text: "◀️ Back", callback_data: "back" }]]);
 
 /* ================== Text blocks ================== */
@@ -200,15 +213,16 @@ async function onUpdate(upd) {
     if (ok) {
       const dest = wd.kind === "email" ? `email: <b>${esc(wd.value)}</b>` : `UPI: <b>${esc(wd.value)}</b>`;
       await TG.send(wd.user, `🎉 <b>Your withdrawal #${wid} has been APPROVED.</b>\nCheck your ${dest}.`, BACK_KB);
-      // Proof channel post (same text/format; only PROOF_CH parsing fixed)
-      if (PROOF_CH) {
+
+      // post to proof channel (supports ID or @username)
+      if (PROOF_TARGET) {
         const masked = wd.kind === "email" ? maskEmail(wd.value) : maskUPI(wd.value);
         const title = `✅ Withdrawal Paid`;
         const text =
           `<b>${title}</b>\nID: <b>${wid}</b>\nUser: ${uu.name ? esc(uu.name) : uu.id}\n` +
           `${wd.kind === "email" ? `Email: <b>${esc(masked)}</b>` : `UPI: <b>${esc(masked)}</b>`}\n` +
           `Amount: <b>${wd.amount}</b>`;
-        await TG.send(PROOF_CH, text);
+        await TG.send(PROOF_TARGET, text);
       }
     } else {
       await TG.send(wd.user, `❌ <b>Your withdrawal #${wid} was REJECTED.</b>\nAmount refunded.`, BACK_KB);
@@ -291,10 +305,12 @@ async function onUpdate(upd) {
     }
 
     if (data === "ref") {
-      // (same as your original)
-      const link = `https://t.me/${(upd?.my_chat_member?.chat?.username) || ""}?start=${from.id}`;
+      const uname = await getBotUsername();
+      const link = uname
+        ? `https://t.me/${uname}?start=${from.id}`
+        : `https://t.me/<your_bot_username>?start=${from.id}`;
       await TG.edit(chat_id, cb.message.message_id,
-        `👥 <b>Your Referrals:</b> <b>${u.refs}</b>\n🔗 Invite link: <code>https://t.me/<your_bot_username>?start=${from.id}</code>\n(ऊपर अपने बॉट का यूज़रनेम भरें)`,
+        `👥 <b>Your Referrals:</b> <b>${u.refs}</b>\n🔗 Invite link: <code>${esc(link)}</code>`,
         BACK_KB);
       return;
     }
@@ -344,7 +360,7 @@ async function onUpdate(upd) {
   if (m?.text) {
     const txt = m.text.trim();
 
-    // Admin commands
+    // Admin commands (unchanged)
     if (isAdmin(from.id) && /^\/(add|sub)\s+\d+\s+\d+$/.test(txt)) {
       const [, cmd, uidStr, amtStr] = txt.match(/^\/(add|sub)\s+(\d+)\s+(\d+)$/);
       const tgt = await getUser(+uidStr);
