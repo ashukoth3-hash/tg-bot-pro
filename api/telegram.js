@@ -16,11 +16,14 @@ const CHANNELS = (process.env.CHANNELS || "")
   .map(s => s.trim())
   .filter(Boolean); // e.g. ['@ch1','@ch2']
 
+// ✅ FIX: PROOF_CHANNEL_ID can be numeric (-100...) OR @username
 const PROOF_CH = process.env.PROOF_CHANNEL_ID
-  ? +process.env.PROOF_CHANNEL_ID
+  ? (/^-?\d+$/.test(process.env.PROOF_CHANNEL_ID)
+      ? +process.env.PROOF_CHANNEL_ID
+      : process.env.PROOF_CHANNEL_ID.trim())
   : null;
 
-// ✅ NEW (optional): show “Proofs” button if URL is set
+// ✅ OPTIONAL: menu button to open proofs channel (no effect on posting)
 const PROOF_CH_URL = process.env.PROOF_CHANNEL_URL || "";
 
 const BONUS_PER_DAY = +(process.env.BONUS_PER_DAY || 10);
@@ -82,21 +85,18 @@ const TG = {
   },
 };
 
-// ✅ MAIN_KB (unchanged text/flow) + optional Proofs row
+/* ===== Main Keyboard (same + optional Proofs row) ===== */
 const mainRows = [
   [{ text: "💰 Balance", callback_data: "bal" }, { text: "🎁 Daily Bonus", callback_data: "bonus" }],
   [{ text: "👥 Referral", callback_data: "ref" }, { text: "💵 Withdraw", callback_data: "wd" }],
 ];
-
 if (PROOF_CH_URL) {
-  mainRows.push([{ text: "📄 Proofs", url: PROOF_CH_URL }]);
+  mainRows.push([{ text: "📄 Proofs", url: PROOF_CH_URL }]); // just opens channel
 }
-
 mainRows.push([{ text: "🏆 Leaderboard", callback_data: "lb" }]);
 if (ADMINS.length) mainRows.push([{ text: "🛠 Admin Panel", callback_data: "ad" }]);
 
 const MAIN_KB = TG.kb(mainRows);
-
 const BACK_KB = TG.kb([[{ text: "◀️ Back", callback_data: "back" }]]);
 
 /* ================== Text blocks ================== */
@@ -200,7 +200,7 @@ async function onUpdate(upd) {
     if (ok) {
       const dest = wd.kind === "email" ? `email: <b>${esc(wd.value)}</b>` : `UPI: <b>${esc(wd.value)}</b>`;
       await TG.send(wd.user, `🎉 <b>Your withdrawal #${wid} has been APPROVED.</b>\nCheck your ${dest}.`, BACK_KB);
-      // post to proof channel
+      // Proof channel post (same text/format; only PROOF_CH parsing fixed)
       if (PROOF_CH) {
         const masked = wd.kind === "email" ? maskEmail(wd.value) : maskUPI(wd.value);
         const title = `✅ Withdrawal Paid`;
@@ -291,6 +291,7 @@ async function onUpdate(upd) {
     }
 
     if (data === "ref") {
+      // (same as your original)
       const link = `https://t.me/${(upd?.my_chat_member?.chat?.username) || ""}?start=${from.id}`;
       await TG.edit(chat_id, cb.message.message_id,
         `👥 <b>Your Referrals:</b> <b>${u.refs}</b>\n🔗 Invite link: <code>https://t.me/<your_bot_username>?start=${from.id}</code>\n(ऊपर अपने बॉट का यूज़रनेम भरें)`,
