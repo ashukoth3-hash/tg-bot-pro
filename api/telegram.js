@@ -1,375 +1,350 @@
-// api/telegram.js
-export const config = { api: { bodyParser: false } };
+export const config = { runtime: "edge" };
 
-// ===== ENV =====
-const TOKEN = process.env.BOT_TOKEN;
-const SECRET = process.env.WEBHOOK_SECRET;
-const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-const ADMIN_ID = Number(process.env.ADMIN_ID || 0);
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;           // e.g. my-secret-9896
+const APP_URL = process.env.APP_URL;                          // https://your-app.vercel.app
+const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-// ===== FORCE-JOIN CHANNELS =====
-const REQUIRED_CHANNELS = [
-  { username: "free_redeem_codes_fire_crypto", url: "https://t.me/free_redeem_codes_fire_crypto" },
-  { username: "Withdrawal_Proofsj", url: "https://t.me/Withdrawal_Proofsj" },
-  { username: "loot4udeal", url: "https://t.me/loot4udeal" }
+// IDs (numeric) – set these in env if you prefer
+const ADMIN_CHAT_ID = Number(process.env.ADMIN_CHAT_ID);      // your Telegram numeric id
+const PROOF_CHANNEL_ID = Number(process.env.PROOF_CHANNEL_ID);// @Withdrawal_Proofsj id
+
+// --- CHANNELS TO FORCE JOIN (edit links here; add/remove items) ---
+const FORCE_CHANNELS = [
+  { title: "free_redeem_codes_fire_crypto", url: "https://t.me/free_redeem_codes_fire_crypto" },
+  { title: "Withdrawal_Proofsj",           url: "https://t.me/Withdrawal_Proofsj" },
+  { title: "loot4udeal",                   url: "https://t.me/loot4udeal" },
 ];
 
-// ===== PROOF CHANNEL =====
-const PROOF_CHANNEL_USERNAME = "Withdrawal_Proofsj";
-const PROOF_CHANNEL_LINK = "https://t.me/Withdrawal_Proofsj";
-
-// ===== BONUS CONFIG =====
-const REF_BONUS_REF = 50;
-const REF_BONUS_NEW = 25;
-const DAILY_BONUS = 10;
-const MIN_WITHDRAW = 500;
-
-// ===== TELEGRAM HELPERS =====
-const TG = {
-  api: (method, payload) =>
-    fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
-    }).then(r => r.json()),
-  answerCb: (id, text, alert = false) =>
-    TG.api("answerCallbackQuery", { callback_query_id: id, text, show_alert: alert }),
-  send: (chat_id, text, extra = {}) =>
-    TG.api("sendMessage", { chat_id, text, parse_mode: "HTML", ...extra }),
-  getMember: (chat, user_id) =>
-    fetch(`https://api.telegram.org/bot${TOKEN}/getChatMember?chat_id=${encodeURIComponent(chat)}&user_id=${user_id}`)
-      .then(r => r.json()),
+const MENU = {
+  Channels: "📣 Channels",
+  Proofs:   "🧾 Proofs",
+  Balance:  "💰 Balance",
+  Bonus:    "🎁 Daily Bonus",
+  Referral: "👥 Referral",
+  Withdraw: "💸 Withdraw",
+  Leader:   "🏆 Leaderboard"
 };
 
-// ===== REDIS HELPERS =====
-async function rget(key) {
-  const res = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
-  });
-  const j = await res.json();
-  return j.result ?? null;
-}
-async function rset(key, val) {
-  await fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
-  });
-}
-async function rincrby(key, by = 1) {
-  const res = await fetch(`${UPSTASH_URL}/incrby/${encodeURIComponent(key)}/${by}`, {
-    method: "POST", headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
-  });
-  const j = await res.json();
-  return Number(j.result || 0);
-}
-async function rsadd(key, member) {
-  await fetch(`${UPSTASH_URL}/sadd/${encodeURIComponent(key)}/${encodeURIComponent(member)}`, {
-    method: "POST", headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
-  });
-}
-async function rsmembers(key) {
-  const res = await fetch(`${UPSTASH_URL}/smembers/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
-  });
-  const j = await res.json();
-  return Array.isArray(j.result) ? j.result : [];
-}
-
-// ===== KEYS =====
-const k = {
-  payload: uid => `payload:${uid}`,
-  coins: uid => `coins:${uid}`,
-  credited: uid => `credited:${uid}`,
-  daily: uid => `daily:${uid}`,
-  users: () => `users_all`,
-  refCount: uid => `ref:${uid}`,
-  name: uid => `name:${uid}`,
-  wseq: () => `w:seq`,
-  w: wid => `w:${wid}`,
-};
-
-// ===== COINS =====
-async function getCoins(uid) { return Number(await rget(k.coins(uid)) || 0); }
-async function addCoins(uid, amt) { return rincrby(k.coins(uid), amt); }
-
-// ===== JOIN GATE =====
-async function isJoinedAll(userId) {
-  for (const c of REQUIRED_CHANNELS) {
-    const j = await TG.getMember(`@${c.username}`, userId);
-    if (!j.ok) return false;
-    const st = j.result?.status;
-    if (!["creator","administrator","member"].includes(st)) return false;
+const redis = {
+  async get(k){ return fetch(UPSTASH_REDIS_REST_URL + "/get/" + encodeURIComponent(k), {
+      headers: { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` }
+  }).then(r=>r.json()).then(j=>j.result ?? null) },
+  async set(k,v){ return fetch(UPSTASH_REDIS_REST_URL + "/set/" + encodeURIComponent(k), {
+      method:"POST", headers: { Authorization:`Bearer ${UPSTASH_REDIS_REST_TOKEN}` , "Content-Type":"application/json"},
+      body: JSON.stringify({ value: typeof v==="string"? v : JSON.stringify(v) })
+  })},
+  async hgetall(k){ return fetch(UPSTASH_REDIS_REST_URL + "/hgetall/" + encodeURIComponent(k), {
+      headers: { Authorization:`Bearer ${UPSTASH_REDIS_REST_TOKEN}` }
+  }).then(r=>r.json()).then(j=>Object.fromEntries(j.result||[])) },
+  async hset(k, obj){
+    const flat = [];
+    for(const [a,b] of Object.entries(obj)) flat.push(a, typeof b==="string"? b : JSON.stringify(b));
+    return fetch(UPSTASH_REDIS_REST_URL + "/hset/" + encodeURIComponent(k), {
+      method:"POST", headers:{ Authorization:`Bearer ${UPSTASH_REDIS_REST_TOKEN}` , "Content-Type":"application/json"},
+      body: JSON.stringify({ field: flat[0], value: flat[1], upsert:true, // single field per call fallback
+      })
+    }).then(()=>Promise.all(Object.entries(obj).slice(1).map(([f,v])=>fetch(UPSTASH_REDIS_REST_URL + "/hset/" + encodeURIComponent(k), {
+      method:"POST", headers:{ Authorization:`Bearer ${UPSTASH_REDIS_REST_TOKEN}` , "Content-Type":"application/json"},
+      body: JSON.stringify({ field: f, value: typeof v==="string"? v : JSON.stringify(v), upsert:true})
+    }))));
+  },
+  async zincr(key, member, by=1){
+    return fetch(UPSTASH_REDIS_REST_URL + "/zincrby/" + encodeURIComponent(key) + "/" + by + "/" + encodeURIComponent(member), {
+      headers:{ Authorization:`Bearer ${UPSTASH_REDIS_REST_TOKEN}` }
+    })
+  },
+  async ztop(key, n=10){
+    return fetch(UPSTASH_REDIS_REST_URL + "/zrevrange/" + encodeURIComponent(key) + "/0/" + (n-1) + "/WITHSCORES", {
+      headers:{ Authorization:`Bearer ${UPSTASH_REDIS_REST_TOKEN}` }
+    }).then(r=>r.json()).then(j=>j.result||[]);
   }
-  return true;
+};
+
+async function tg(method, payload){
+  return fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+    method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(payload)
+  }).then(r=>r.json());
 }
-function joinGateKb() {
-  const rows = REQUIRED_CHANNELS.map(c => [{ text: "Join", url: c.url }]);
-  rows.push([{ text: "✅ Claim", callback_data: "gate:claim" }]);
-  return { reply_markup: { inline_keyboard: rows } };
+const kb = rows => ({ reply_markup: { keyboard: rows, resize_keyboard:true }});
+const ikb = rows => ({ reply_markup: { inline_keyboard: rows }});
+
+const hello = (user) => `Hello 👋 ${displayName(user)}\n`;
+const displayName = (u)=> (u.first_name || u.username || u.id);
+const maskEmail = (e)=>{
+  if(!e) return "";
+  const [name, dom] = e.split("@"); 
+  if(!dom) return e;
+  const half = Math.max(1, Math.floor(name.length/2));
+  return name.slice(0,half) + "***@" + dom;
 }
-async function showJoinGate(chatId) {
-  return TG.send(chatId, "🟢 Must Join All Channels To Use Bot\n◼️ After joining click <b>Claim</b>", joinGateKb());
+const maskUpi = (u)=>{
+  if(!u) return "";
+  const [id, bank] = u.split("@");
+  if(!bank) return u.slice(0, Math.max(1,Math.floor(u.length/2)))+"***";
+  const half = Math.max(1, Math.floor(id.length/2));
+  return id.slice(0,half) + "***@" + bank;
 }
 
-// ===== MAIN MENU =====
-function mainMenuKb() {
-  return {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "📣 Channels", callback_data: "open:channels" }, { text: "📑 Proofs", callback_data: "open:proofs" }],
-        [{ text: "💰 Balance", callback_data: "open:balance" }, { text: "🎁 Daily Bonus", callback_data: "open:daily" }],
-        [{ text: "👥 Referral", callback_data: "open:ref" }, { text: "💸 Withdraw", callback_data: "open:wd" }],
-        [{ text: "🏆 Leaderboard", callback_data: "open:leader" }],
-      ],
-    },
+const mainMenu = () => kb([
+  [MENU.Channels, MENU.Proofs],
+  [MENU.Balance,  MENU.Bonus],
+  [MENU.Referral, MENU.Withdraw],
+  [MENU.Leader]
+]);
+
+const backBtn = () => kb([[ "⬅️ Back" ]]);
+
+const joinScreen = () => ikb([
+  ...FORCE_CHANNELS.map(c=>[{ text: `✅ Join ${c.title}`, url: c.url }]),
+  [{ text:"I’ve Joined ✅", callback_data:"joined_all"}]
+]);
+
+async function ensureUser(user){
+  const key = `user:${user.id}`;
+  const u = await redis.hgetall(key);
+  if(!u.id){
+    await redis.hset(key, { id: String(user.id), name: displayName(user), refs:"0", balance:"0" });
+  } else {
+    if(u.name !== displayName(user)) await redis.hset(key, { name: displayName(user) });
+  }
+  return await redis.hgetall(key);
+}
+
+async function handleStart(msg, payload){
+  const user = msg.from;
+  await ensureUser(user);
+
+  // record referral once
+  if(payload && /^\d+$/.test(payload) && Number(payload)!==user.id){
+    const already = await redis.get(`refdone:${user.id}`);
+    if(!already){
+      await redis.set(`refdone:${user.id}`, "1");
+      await redis.zincr("leaderboard:refs", String(payload), 1);
+      const refUser = await redis.hgetall(`user:${payload}`);
+      if(refUser && refUser.id){
+        // increase ref count & maybe balance
+        await redis.hset(`user:${payload}`, { refs: String(Number(refUser.refs||"0")+1) });
+        await tg("sendMessage", { chat_id: Number(payload), text: `🎉 You referred 1 user! Keep going!`, ...mainMenu() });
+      }
+    }
+  }
+
+  // always show join gate first
+  await tg("sendMessage", {
+    chat_id: msg.chat.id,
+    text: hello(user) + `🔒 To use the bot, please join all required channels first.`,
+    ...joinScreen()
+  });
+}
+
+async function showMenu(chat_id, user){
+  await tg("sendMessage", { chat_id, text: hello(user) + `Welcome Support 🇮🇳👋\nEarn via referrals & daily bonus; redeem by withdraw.`, ...mainMenu() });
+}
+
+async function handleCallback(cb){
+  const { data, message, from } = cb;
+  if(data==="joined_all"){
+    // (Optional) You can hit getChatMember for each channel to HARD-check membership.
+    return showMenu(message.chat.id, from);
+  }
+  if(data.startsWith("wd_approve:")){
+    const wid = data.split(":")[1];
+    const w = JSON.parse(await redis.get(`wd:${wid}`) || "{}");
+    if(!w.id) return;
+    // notify user
+    await tg("sendMessage", { chat_id: w.user_id, text: `🎉 Your withdrawal #${w.id} has been APPROVED. ${w.type==="email" ? `Check your email: ${w.email}` : `UPI: ${w.upi}`}` });
+    // post to proof channel (masked)
+    const masked = w.type==="email" ? maskEmail(w.email) : maskUpi(w.upi);
+    await tg("sendMessage", {
+      chat_id: PROOF_CHANNEL_ID,
+      text: `✅ *Withdrawal Paid*\nID: *${w.id}*\nUser: ${w.user_id} (${w.user_name})\n${w.type==="email" ? `Email: ${masked}` : `UPI: ${masked}`}\nAmount: *${w.amount}*`,
+      parse_mode:"Markdown"
+    });
+    await tg("editMessageReplyMarkup", { chat_id: message.chat.id, message_id: message.message_id, reply_markup: { inline_keyboard: [] }});
+  }
+  if(data.startsWith("wd_reject:")){
+    const wid = data.split(":")[1];
+    const w = JSON.parse(await redis.get(`wd:${wid}`) || "{}");
+    if(!w.id) return;
+    await tg("sendMessage", { chat_id: w.user_id, text: `❌ Your withdrawal #${w.id} has been REJECTED.` });
+    await tg("editMessageReplyMarkup", { chat_id: message.chat.id, message_id: message.message_id, reply_markup: { inline_keyboard: [] }});
+  }
+}
+
+async function handleText(msg){
+  const { text, chat, from } = msg;
+  const me = await ensureUser(from);
+
+  // greet on every command click
+  if(text === "⬅️ Back"){ return showMenu(chat.id, from); }
+
+  if(text === MENU.Channels){
+    return tg("sendMessage", { chat_id: chat.id, text: hello(from) + "Please join all the channels below:", ...joinScreen() });
+  }
+  if(text === MENU.Proofs){
+    return tg("sendMessage", { chat_id: chat.id, text: hello(from) + "📜 Check latest proofs here:\nhttps://t.me/Withdrawal_Proofsj", ...backBtn() });
+  }
+  if(text === MENU.Balance){
+    return tg("sendMessage", { chat_id: chat.id, text: hello(from) + `Your balance: *${me.balance || 0}* coins`, parse_mode:"Markdown", ...backBtn() });
+  }
+  if(text === MENU.Bonus){
+    // simple daily (24h) limiter
+    const key = `bonus:${from.id}`;
+    const last = await redis.get(key);
+    if(last) return tg("sendMessage", { chat_id: chat.id, text: hello(from) + "⏳ Daily bonus already claimed. Try again later.", ...backBtn() });
+    const amount = 10;
+    await redis.set(key, "1");
+    await redis.hset(`user:${from.id}`, { balance: String(Number(me.balance||0)+amount) });
+    return tg("sendMessage", { chat_id: chat.id, text: hello(from) + `🎁 Daily bonus +${amount} coins added!`, ...backBtn() });
+  }
+  if(text === MENU.Referral){
+    const link = `https://t.me/${(await tg("getMe",{})).result.username}?start=${from.id}`;
+    const refs = me.refs || 0;
+    return tg("sendMessage", { chat_id: chat.id, text: hello(from) + `👥 *Referral*\nYour refs: *${refs}*\nShare your link:\n${link}`, parse_mode:"Markdown", ...backBtn() });
+  }
+  if(text === MENU.Leader){
+    const arr = await redis.ztop("leaderboard:refs", 10); // [member,score,member,score...]
+    const lines = [];
+    for(let i=0;i<arr.length;i+=2){
+      const uid = arr[i];
+      const score = arr[i+1];
+      const u = await redis.hgetall(`user:${uid}`);
+      lines.push(`${i/2+1}. ${u.name || uid} - ${score} refs`);
+    }
+    return tg("sendMessage", { chat_id: chat.id, text: hello(from) + `🏆 *Leaderboard*\n` + (lines.join("\n") || "No refs yet."), parse_mode:"Markdown", ...backBtn() });
+  }
+  if(text === MENU.Withdraw){
+    await redis.hset(`state:${from.id}`, { mode:"choose_withdraw" });
+    return tg("sendMessage", { chat_id: chat.id, text: hello(from) + "Choose a method:", ...ikb([
+      [{ text:"📧 Gmail", callback_data:"choose_email" }, { text:"🏦 UPI", callback_data:"choose_upi" }]
+    ])});
+  }
+
+  // --- contextual states ---
+  const state = await redis.hgetall(`state:${from.id}`);
+  if(state.mode === "await_email"){
+    // expecting: "email amount"
+    const parts = text.trim().split(/\s+/);
+    if(parts.length<2 || !parts[0].includes("@")) {
+      return tg("sendMessage", { chat_id: chat.id, text: hello(from) + "Send like:\n`youremail@gmail.com 1000`", parse_mode:"Markdown" });
+    }
+    const email = parts[0];
+    const amount = Number(parts[1]);
+    return createWithdraw(from, chat.id, { type:"email", email, amount });
+  }
+  if(state.mode === "await_upi"){
+    // expecting: "upi amount"
+    const parts = text.trim().split(/\s+/);
+    if(parts.length<2 || !parts[0].includes("@")) {
+      return tg("sendMessage", { chat_id: chat.id, text: hello(from) + "Send like:\n`yourupi@bank 1000`", parse_mode:"Markdown" });
+    }
+    const upi = parts[0];
+    const amount = Number(parts[1]);
+    return createWithdraw(from, chat.id, { type:"upi", upi, amount });
+  }
+
+  // admin commands
+  if(text.startsWith("/admin") && from.id === ADMIN_CHAT_ID){
+    return tg("sendMessage", { chat_id: chat.id, text: "🛠 *Admin Panel*\nUse inline buttons below.", parse_mode:"Markdown", ...ikb([
+      [{ text:"➕ Add 100 coins to me", callback_data:"adm_add_100" }],
+      [{ text:"📣 Broadcast (reply to a message)", callback_data:"adm_bc_hint" }]
+    ])});
+  }
+
+  // if user chooses in inline (we handle here because callback_query is separate too)
+  if(text === "choose_email" || text === "choose_upi"){ /* fallthrough if needed */ }
+
+  // default -> show menu
+  return showMenu(chat.id, from);
+}
+
+async function createWithdraw(from, chat_id, {type, email, upi, amount}){
+  const me = await redis.hgetall(`user:${from.id}`);
+  const bal = Number(me.balance||0);
+  if(!amount || amount<=0) return tg("sendMessage", { chat_id, text: hello(from) + "Amount invalid." });
+  if(bal < amount) return tg("sendMessage", { chat_id, text: hello(from) + "Insufficient balance." });
+
+  const wid = Date.now().toString().slice(-7);
+  const payload = {
+    id: wid, user_id: from.id, user_name: displayName(from),
+    type, email, upi, amount
   };
-}
-const backKb = { reply_markup: { inline_keyboard: [[{ text: "⬅️ Back", callback_data: "back:main" }]] } };
-async function sendMainMenu(chatId) {
-  return TG.send(chatId, "Welcome 👋\nEarn via referrals & daily bonus; redeem by withdraw.", mainMenuKb());
+  await redis.set(`wd:${wid}`, JSON.stringify(payload));
+  await redis.hset(`state:${from.id}`, { mode:"" });
+  // (optional) hold/lock coins here
+  await redis.hset(`user:${from.id}`, { balance: String(bal-amount) });
+
+  // user confirmation
+  await tg("sendMessage", {
+    chat_id,
+    text: `✅ Withdraw request received.\nID: *${wid}*\n${type==="email" ? `Email: ${email}` : `UPI: ${upi}`}\nAmount: *${amount}*`,
+    parse_mode:"Markdown",
+    ...backBtn()
+  });
+  // admin message (FULL details)
+  await tg("sendMessage", {
+    chat_id: ADMIN_CHAT_ID,
+    text: `💸 *Withdraw Request*\nID: *${wid}*\nUser: ${from.id} (${displayName(from)})\n${type==="email" ? `Email: ${email}` : `UPI: ${upi}`}\nAmount: *${amount}*`,
+    parse_mode:"Markdown",
+    ...ikb([
+      [{ text:"✅ Approve", callback_data:`wd_approve:${wid}` }, { text:"❌ Reject", callback_data:`wd_reject:${wid}` }]
+    ])
+  });
 }
 
-// ===== REFERRAL =====
-async function applyReferral(uid, name) {
-  const payload = await rget(k.payload(uid));
-  if (!payload || !payload.startsWith("ref_")) return;
-  const refId = payload.slice(4);
-  if (refId === String(uid)) return;
-  const already = await rget(k.credited(uid));
-  if (already) return;
-  await addCoins(uid, REF_BONUS_NEW);
-  await addCoins(refId, REF_BONUS_REF);
-  await rincrby(k.refCount(refId), 1);
-  if (name) await rset(k.name(uid), name);
-  await rset(k.credited(uid), "1");
-}
-
-// ===== WITHDRAW HELPERS =====
-async function newWithdrawId() {
-  const n = await rincrby(k.wseq(), 1);
-  return String(n);
-}
-async function saveWithdraw(wid, obj) {
-  await rset(k.w(wid), JSON.stringify(obj));
-}
-async function loadWithdraw(wid) {
-  const v = await rget(k.w(wid));
-  try { return v ? JSON.parse(v) : null; } catch { return null; }
-}
-function maskEmail(email) {
-  const [u,d] = email.split("@");
-  return u.slice(0,3)+"***@"+d;
-}
-function maskUpi(upi) {
-  return upi.slice(0,3)+"***"+upi.slice(-3);
-}
-
-// ===== HANDLERS =====
-async function handleStart(msg) {
-  const chatId = msg.chat.id;
-  const uid = msg.from.id;
-  const uname = msg.from.first_name || "User";
-  const parts = (msg.text||"").split(" ");
-  if (parts[1]) await rset(k.payload(uid), parts[1]);
-
-  // हर बार पहले gate check
-  const ok = await isJoinedAll(uid);
-  if (!ok) return showJoinGate(chatId);
-
-  await applyReferral(uid, uname);
-  await rset(k.name(uid), uname);
-  return sendMainMenu(chatId);
-}
-async function handleGateClaim(cb) {
-  const ok = await isJoinedAll(cb.from.id);
-  if (!ok) return showJoinGate(cb.message.chat.id);
-  await applyReferral(cb.from.id, cb.from.first_name);
-  await rset(k.name(cb.from.id), cb.from.first_name);
-  await sendMainMenu(cb.message.chat.id);
-}
-
-// ===== SECTIONS =====
-async function openSection(section, cb) {
-  const chatId = cb.message.chat.id;
-  const uid = cb.from.id;
-
-  if (section==="proofs") {
-    return TG.send(chatId,"📑 Withdrawal proofs:",{
-      reply_markup:{inline_keyboard:[
-        [{text:"🔗 Open Proof Channel",url:PROOF_CHANNEL_LINK}],
-        [{text:"⬅️ Back",callback_data:"back:main"}]
-      ]}
-    });
+export default async function handler(req){
+  // webhook guard
+  const url = new URL(req.url);
+  if(!url.pathname.endsWith(`/api/telegram`) && !url.pathname.endsWith(`/api/telegram/${WEBHOOK_SECRET}`)){
+    // simple health/debug
+    if(url.pathname.endsWith("/api")) return new Response(JSON.stringify({ ok:true, hello:"telegram" }), { headers:{ "content-type":"application/json"}});
+    return new Response("Not found", { status:404 });
   }
-  if (section==="balance") {
-    const coins=await getCoins(uid);
-    return TG.send(chatId,`💰 Balance: <b>${coins}</b> coins`,backKb);
-  }
-  if (section==="daily") {
-    const today=new Date().toISOString().slice(0,10);
-    const last=await rget(k.daily(uid));
-    if(last===today) return TG.send(chatId,"✅ Already claimed today",backKb);
-    await rset(k.daily(uid),today);
-    const bal=await addCoins(uid,DAILY_BONUS);
-    return TG.send(chatId,`+${DAILY_BONUS} coins added!\nNew balance: <b>${bal}</b>`,backKb);
-  }
-  if (section==="ref") {
-    const me=cb.from.id;
-    const botInfo=await TG.api("getMe",{});
-    const botUser=botInfo?.result?.username;
-    const link=`https://t.me/${botUser}?start=ref_${me}`;
-    const count=await rget(k.refCount(me))||0;
-    return TG.send(chatId,`👥 Referral link:\n<code>${link}</code>\nRefs: <b>${count}</b>`,backKb);
-  }
-  if (section==="leader") {
-    const users=await rsmembers(k.users());
-    const arr=[];
-    for(const u of users){
-      const c=Number(await rget(k.refCount(u))||0);
-      const nm=await rget(k.name(u))||u;
-      arr.push({nm,c});
+
+  const update = await req.json().catch(()=> ({}));
+
+  if(update.message){
+    const msg = update.message;
+
+    // handle commands & text
+    if(msg.text){
+      // deep-link start
+      if(msg.text.startsWith("/start")){
+        const payload = msg.text.split(" ").slice(1).join(" ");
+        await handleStart(msg, payload);
+        return new Response("OK");
+      }
+      // choose method via callbacks not pressed? Allow text keywords:
+      if(msg.text.toLowerCase()==="choose_email"){
+        await redis.hset(`state:${msg.from.id}`, { mode:"await_email" });
+        await tg("sendMessage", { chat_id: msg.chat.id, text: hello(msg.from) + "Send email & amount like:\n`youremail@gmail.com 1000`", parse_mode:"Markdown" });
+        return new Response("OK");
+      }
+      if(msg.text.toLowerCase()==="choose_upi"){
+        await redis.hset(`state:${msg.from.id}`, { mode:"await_upi" });
+        await tg("sendMessage", { chat_id: msg.chat.id, text: hello(msg.from) + "Send UPI & amount like:\n`yourupi@bank 1000`", parse_mode:"Markdown" });
+        return new Response("OK");
+      }
+      await handleText(msg);
+      return new Response("OK");
     }
-    arr.sort((a,b)=>b.c-a.c);
-    const top=arr.slice(0,10);
-    let txt="🏆 Leaderboard\n";
-    let i=1;
-    for(const t of top){
-      txt+=`${i}. ${t.nm} - ${t.c} refs\n`;
-      i++;
+  }
+
+  if(update.callback_query){
+    const cb = update.callback_query;
+    if(cb.data==="choose_email"){
+      await redis.hset(`state:${cb.from.id}`, { mode:"await_email" });
+      await tg("sendMessage", { chat_id: cb.from.id, text: hello(cb.from) + "Send email & amount like:\n`youremail@gmail.com 1000`", parse_mode:"Markdown" });
+    } else if(cb.data==="choose_upi"){
+      await redis.hset(`state:${cb.from.id}`, { mode:"await_upi" });
+      await tg("sendMessage", { chat_id: cb.from.id, text: hello(cb.from) + "Send UPI & amount like:\n`yourupi@bank 1000`", parse_mode:"Markdown" });
+    } else {
+      await handleCallback(cb);
     }
-    return TG.send(chatId,txt,backKb);
-  }
-  if (section==="wd") {
-    return TG.send(chatId,"Choose withdraw method:",{
-      reply_markup:{inline_keyboard:[
-        [{text:"💌 Gmail Withdraw",callback_data:"wd:gmail"}],
-        [{text:"🏦 UPI Withdraw",callback_data:"wd:upi"}],
-        [{text:"⬅️ Back",callback_data:"back:main"}]
-      ]}
-    });
-  }
-}
-
-// ===== WITHDRAW FLOW =====
-async function handleWithdrawFlow(cb) {
-  const chatId=cb.message.chat.id;
-  if(cb.data==="wd:gmail") return TG.send(chatId,"Send Gmail like:\n<code>/gmail yourmail@gmail.com amount</code>",backKb);
-  if(cb.data==="wd:upi") return TG.send(chatId,"Send UPI like:\n<code>/upi upi@okicici amount</code>",backKb);
-}
-
-// ===== WITHDRAW CMD =====
-async function handleWithdrawCmd(msg){
-  const chatId=msg.chat.id;
-  const uid=msg.from.id;
-  const parts=(msg.text||"").trim().split(/\s+/);
-
-  if(parts[0]==="/gmail"){
-    const email=parts[1]; const amt=Number(parts[2]);
-    const coins=await getCoins(uid);
-    if(coins<amt||amt<MIN_WITHDRAW) return TG.send(chatId,"❌ Not enough balance or below minimum",backKb);
-    await addCoins(uid,-amt);
-    const wid=await newWithdrawId();
-    const req={id:wid,uid,email,upi:null,amt,status:"pending"};
-    await saveWithdraw(wid,req);
-    await TG.send(chatId,`✅ Withdraw request ID ${wid} submitted (Email).`,backKb);
-    await TG.send(ADMIN_ID,`Req #${wid}\nUser:${uid}\nEmail:${email}\nAmt:${amt}`,{
-      reply_markup:{inline_keyboard:[
-        [{text:"Approve",callback_data:"adm:approve:"+wid},{text:"Reject",callback_data:"adm:reject:"+wid}]
-      ]}
-    });
+    return new Response("OK");
   }
 
-  if(parts[0]==="/upi"){
-    const upi=parts[1]; const amt=Number(parts[2]);
-    const coins=await getCoins(uid);
-    if(coins<amt||amt<MIN_WITHDRAW) return TG.send(chatId,"❌ Not enough balance or below minimum",backKb);
-    await addCoins(uid,-amt);
-    const wid=await newWithdrawId();
-    const req={id:wid,uid,email:null,upi,amt,status:"pending"};
-    await saveWithdraw(wid,req);
-    await TG.send(chatId,`✅ Withdraw request ID ${wid} submitted (UPI).`,backKb);
-    await TG.send(ADMIN_ID,`Req #${wid}\nUser:${uid}\nUPI:${upi}\nAmt:${amt}`,{
-      reply_markup:{inline_keyboard:[
-        [{text:"Approve",callback_data:"adm:approve:"+wid},{text:"Reject",callback_data:"adm:reject:"+wid}]
-      ]}
-    });
-  }
-}
-
-// ===== ADMIN ACTION =====
-async function onAdminApprove(wid){
-  const w=await loadWithdraw(wid);
-  if(!w||w.status!=="pending") return;
-  w.status="approved"; await saveWithdraw(wid,w);
-  let masked=w.email?maskEmail(w.email):maskUpi(w.upi);
-  await TG.send(`@${PROOF_CHANNEL_USERNAME}`,`✅ Paid #${w.id}\nUser:${w.uid}\n${masked}\nAmt:${w.amt}`);
-  await TG.send(w.uid,`🎉 Withdraw #${w.id} Approved.`);
-}
-async function onAdminReject(wid){
-  const w=await loadWithdraw(wid);
-  if(!w||w.status!=="pending") return;
-  w.status="rejected"; await saveWithdraw(wid,w);
-  await addCoins(w.uid,w.amt);
-  await TG.send(w.uid,`🚫 Withdraw #${w.id} Rejected. Refunded.`);
-}
-
-// ===== ADMIN COMMANDS =====
-async function handleAdminCommands(msg) {
-  if (msg.from.id !== ADMIN_ID) return;
-  const chatId = msg.chat.id;
-  const text = (msg.text||"").trim();
-
-  if(text.startsWith("/add ")){
-    const [,id,amt]=text.split(" ");
-    await addCoins(id,Number(amt));
-    const bal=await getCoins(id);
-    return TG.send(chatId,`Added ${amt} → ${id} balance: ${bal}`);
-  }
-  if(text.startsWith("/deduct ")){
-    const [,id,amt]=text.split(" ");
-    await addCoins(id,-Number(amt));
-    const bal=await getCoins(id);
-    return TG.send(chatId,`Deducted ${amt} → ${id} balance: ${bal}`);
-  }
-  if(text.startsWith("/bal ")){
-    const [,id]=text.split(" ");
-    const bal=await getCoins(id);
-    return TG.send(chatId,`${id} balance: ${bal}`);
-  }
-  if(text.startsWith("/broadcast ")){
-    const message=text.replace("/broadcast ","");
-    const users=await rsmembers(k.users());
-    for(const u of users) await TG.send(u,`📣 ${message}`).catch(()=>{});
-    return TG.send(chatId,`Broadcast sent to ${users.length}`);
-  }
-  if(text.startsWith("/help")){
-    return TG.send(chatId,"Admin commands:\n/add id amt\n/deduct id amt\n/bal id\n/broadcast msg");
-  }
-}
-
-// ===== MAIN HANDLER =====
-async function parseBody(req){const chunks=[];for await(const c of req)chunks.push(c);return JSON.parse(Buffer.concat(chunks).toString("utf8")||"{}");}
-export default async function handler(req,res){
-  const url=new URL(req.url,"http://localhost");
-  if(SECRET && url.searchParams.get("secret")!==SECRET) return res.status(401).json({ok:false});
-  if(req.method!=="POST") return res.status(200).json({ok:true});
-  const u=await parseBody(req);
-
-  if(u.message){
-    const m=u.message; const t=m.text||"";
-    if(m.from.id===ADMIN_ID && /^\/(add|deduct|bal|broadcast|help)/.test(t)) await handleAdminCommands(m);
-    if(t.startsWith("/start")) await handleStart(m);
-    if(t.startsWith("/gmail")||t.startsWith("/upi")) await handleWithdrawCmd(m);
-  }
-  if(u.callback_query){
-    const cb=u.callback_query; const d=cb.data;
-    if(d==="gate:claim") await handleGateClaim(cb);
-    if(d.startsWith("open:")) await openSection(d.split(":")[1],cb);
-    if(d.startsWith("wd:")) await handleWithdrawFlow(cb);
-    if(d==="back:main") await sendMainMenu(cb.message.chat.id);
-    if(d.startsWith("adm:approve:")) await onAdminApprove(d.split(":")[2]);
-    if(d.startsWith("adm:reject:")) await onAdminReject(d.split(":")[2]);
-  }
-  return res.status(200).json({ok:true});
+  return new Response("OK");
 }
