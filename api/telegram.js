@@ -1,541 +1,408 @@
 export const config = { runtime: "edge" };
 
-/** ========= ENV =========
-Required:
-- BOT_TOKEN
-- WEBHOOK_SECRET
-- APP_URL (e.g., https://tg-bot-pro.vercel.app)
-- UPSTASH_REDIS_REST_URL
-- UPSTASH_REDIS_REST_TOKEN
-
-Optional:
-- ADMIN_ID           => comma-separated user IDs
-- CHANNEL_1_URL      => https://t.me/yourchannel1
-- CHANNEL_2_URL
-- CHANNEL_3_URL
-- CHANNEL_1_ID       => -100xxxxxxxxxx  (for membership check)
-- CHANNEL_2_ID
-- CHANNEL_3_ID
-- PROOF_CHANNEL_ID   => -100xxxxxxxxxx   (where paid/received posts go)
-========================**/
-
-// ---------- Small utils ----------
-const j = (v) => JSON.stringify(v);
-const esc = (s="") => s.replace(/[<>&]/g, m => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[m]));
-const pick = (obj, ...keys) => keys.reduce((o,k)=> (obj?.[k]!==undefined&&(o[k]=obj[k]), o), {});
-const now = () => Math.floor(Date.now()/1000);
-
-// ---------- Telegram client ----------
+/* ================== ENV & Helpers ================== */
 const BOT = process.env.BOT_TOKEN;
 const TG_API = `https://api.telegram.org/bot${BOT}`;
-const TG = {
-  async send(chat_id, text, kb) {
-    const body = { chat_id, text, parse_mode: "HTML", ...kb };
-    return fetch(`${TG_API}/sendMessage`, { method:"POST", headers:{ "content-type":"application/json" }, body: j(body) });
-  },
-  async edit(chat_id, msg_id, text, kb) {
-    const body = { chat_id, message_id: msg_id, text, parse_mode: "HTML", ...kb };
-    return fetch(`${TG_API}/editMessageText`, { method:"POST", headers:{ "content-type":"application/json" }, body: j(body) });
-  },
-  async answerCb(id, opts) {
-    return fetch(`${TG_API}/answerCallbackQuery`, { method:"POST", headers:{ "content-type":"application/json" }, body: j({ callback_query_id:id, ...opts }) });
-  },
-  kb(inline_keyboard){ return { reply_markup: { inline_keyboard } }; },
-  async getChatMember(chat_id, user_id){
-    const u = `${TG_API}/getChatMember?chat_id=${encodeURIComponent(chat_id)}&user_id=${user_id}`;
-    const r = await fetch(u); return r.json();
-  }
-};
+const APP_URL = process.env.APP_URL;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
-// ---------- Redis (Upstash REST) ----------
+const ADMINS = (process.env.ADMIN_ID || "")
+  .split(",")
+  .map(s => +s.trim())
+  .filter(Boolean);
+
+const CHANNELS = (process.env.CHANNELS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean); // e.g. ['@ch1','@ch2']
+
+const PROOF_CH = process.env.PROOF_CHANNEL_ID
+  ? +process.env.PROOF_CHANNEL_ID
+  : null;
+
+const BONUS_PER_DAY = +(process.env.BONUS_PER_DAY || 10);
+const REF_BONUS = +(process.env.REF_BONUS || 20);
+const MIN_WITHDRAW = +(process.env.MIN_WITHDRAW || 100);
+
+const j = v => JSON.stringify(v);
+const now = () => Math.floor(Date.now() / 1000);
+const esc = (s = "") => s.replace(/[<>&]/g, m => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[m]));
+const isAdmin = id => ADMINS.includes(+id);
+
+/* ===== Upstash Redis REST ===== */
 const RURL = process.env.UPSTASH_REDIS_REST_URL;
 const RTOK = process.env.UPSTASH_REDIS_REST_TOKEN;
-async function rcmd(cmd, ...args){
-  const body = j([cmd, ...args]);
-  const r = await fetch(RURL, { method:"POST", headers:{ "authorization":`Bearer ${RTOK}`, "content-type":"application/json" }, body });
-  return r.json();
-}
-// Basic helpers
-const rget = (k)=> rcmd("GET", k).then(x=>x.result ?? null);
-const rset = (k,v)=> rcmd("SET", k, typeof v==="string"?v:j(v));
-const rdel = (k)=> rcmd("DEL", k);
-const zincr = (k,m,by)=> rcmd("ZINCRBY", k, by, m);
-const zrevrange = (k,start,stop,withScores)=> rcmd("ZREVRANGE", k, start, stop, withScores?"WITHSCORES":undefined).then(x=>x.result);
 
-// ---------- App constants ----------
-const ADMINS = (process.env.ADMIN_ID||"").split(",").map(s=>Number(s.trim())).filter(Boolean);
-const isAdmin = (id)=> ADMINS.includes(Number(id));
-const MAIN_KB = TG.kb([
-  [{text:"📣 Channels", callback_data:"menu_channels"},{text:"🧾 Proofs", callback_data:"menu_proofs"}],
-  [{text:"💰 Balance", callback_data:"menu_bal"},{text:"🎁 Daily Bonus", callback_data:"menu_daily"}],
-  [{text:"👥 Referral", callback_data:"menu_ref"},{text:"💵 Withdraw", callback_data:"menu_wd"}],
-  [{text:"🏆 Leaderboard", callback_data:"menu_lb"}],
-  [ ...(ADMINS.length? [[{text:"🛠 Admin", callback_data:"ad_home"}]] : []) ]
-]);
-const BACK_KB = TG.kb([[{text:"◀️ Back", callback_data:"back_home"}]]);
+async function r(cmd, ...args) {
+  const res = await fetch(RURL, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${RTOK}`,
+      "content-type": "application/json",
+    },
+    body: j([cmd, ...args]),
+  }).then(r => r.json());
+  return res.result;
+}
+const rget = k => r("GET", k);
+const rset = (k, v) => r("SET", k, typeof v === "string" ? v : j(v));
+const rdel = k => r("DEL", k);
 
-// ---------- Join gate ----------
-function joinKB(){
-  const rows = [];
-  if (process.env.CHANNEL_1_URL) rows.push([{ text:"✅ Join Channel 1 ↗️", url:process.env.CHANNEL_1_URL }]);
-  if (process.env.CHANNEL_2_URL) rows.push([{ text:"✅ Join Channel 2 ↗️", url:process.env.CHANNEL_2_URL }]);
-  if (process.env.CHANNEL_3_URL) rows.push([{ text:"✅ Join Channel 3 ↗️", url:process.env.CHANNEL_3_URL }]);
-  rows.push([{ text:"🎁 Claim & Continue", callback_data:"claim_joined" }]);
-  return TG.kb(rows);
-}
-async function needsJoin(user_id){
-  const ids = [process.env.CHANNEL_1_ID, process.env.CHANNEL_2_ID, process.env.CHANNEL_3_ID]
-              .map(x=>x?.trim()).filter(Boolean);
-  if (!ids.length) return false;
-  for (const cid of ids){
-    try{
-      const j = await TG.getChatMember(cid, user_id);
-      const st = j?.result?.status;
-      if (!["member","administrator","creator"].includes(st)) return true;
-    }catch(e){ return true; }
-  }
-  return false;
-}
-
-// ---------- User storage ----------
-const kUser = (id)=> `u:${id}`;
-const kCoins= (id)=> `u:${id}:coins`;
-const kName = (id)=> `u:${id}:name`;
-const kRefs = (id)=> `u:${id}:refs`;
-const kWD   = (id)=> `u:${id}:lastwd`;      // last withdrawal id
-const kEmail= (id)=> `u:${id}:email`;
-const kUPI  = (id)=> `u:${id}:upi`;
-const kState= (id)=> `u:${id}:state`;
-const ZREFS = `z:refs`;
-
-async function ensureUser(u){
-  await rset(kName(u.id), u.name || "");
-  await rcmd("SETNX", kCoins(u.id), 0);
-  await rcmd("SETNX", kRefs(u.id), 0);
-}
-async function addCoins(id, amt){ await rcmd("INCRBY", kCoins(id), amt); }
-async function subCoins(id, amt){ await rcmd("DECRBY", kCoins(id), amt); }
-async function setBalance(id, amt){ await rset(kCoins(id), amt); }
-async function getCoins(id){ const v= await rget(kCoins(id)); return Number(v||0); }
-async function incRef(id){ await rcmd("INCR", kRefs(id)); await zincr(ZREFS, String(id), 1); }
-async function getAllUserIds(){ // best-effort: store seen ids in a set
-  const raw = await rget("users:index");
-  return raw? JSON.parse(raw) : [];
-}
-async function addIndex(id){
-  const raw = await rget("users:index");
-  const arr = raw? JSON.parse(raw) : [];
-  if (!arr.includes(String(id))){ arr.push(String(id)); await rset("users:index", j(arr)); }
-}
-
-// ---------- Mask helpers ----------
-function maskEmail(e=""){
-  const [u, d=""] = e.split("@");
-  if (!u || !d) return e;
-  const uShow = u.slice(0, Math.min(3,u.length));
-  const dShow = d.slice(0, Math.max(1, Math.floor(d.length/2)));
-  return `${uShow}***@${dShow}***`;
-}
-function maskUPI(u=""){
-  const [id, host=""] = u.split("@");
-  if (!id || !host) return u;
-  const iShow = id.slice(0, Math.min(3,id.length));
-  const hShow = host.slice(0, Math.max(1, Math.floor(host.length/2)));
-  return `${iShow}***@${hShow}***`;
-}
-
-// ---------- Keyboards ----------
-const KB = {
-  back: BACK_KB,
-  wdMode: TG.kb([
-    [{text:"✉️ Email", callback_data:"wd_email"}, {text:"🏦 UPI", callback_data:"wd_upi"}],
-    [{text:"◀️ Back", callback_data:"back_home"}]
-  ]),
-  adHome: TG.kb([
-    [{text:"➕ Add", callback_data:"ad_add"}, {text:"➖ Deduct", callback_data:"ad_ded"}],
-    [{text:"🧮 Set Balance", callback_data:"ad_setbal"}],
-    [{text:"📣 Broadcast", callback_data:"ad_bc"}],
-    [{text:"◀️ Back", callback_data:"back_home"}]
-  ]),
+/* ===== Telegram minimal client ===== */
+const TG = {
+  async send(chat_id, text, kb) {
+    return fetch(`${TG_API}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: j({ chat_id, text, parse_mode: "HTML", ...kb }),
+    });
+  },
+  async edit(chat_id, message_id, text, kb) {
+    return fetch(`${TG_API}/editMessageText`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: j({ chat_id, message_id, text, parse_mode: "HTML", ...kb }),
+    });
+  },
+  async answerCb(id, opts) {
+    return fetch(`${TG_API}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: j({ callback_query_id: id, ...opts }),
+    });
+  },
+  kb(inline_keyboard) {
+    return { reply_markup: { inline_keyboard } };
+  },
+  async getChatMember(chat, user) {
+    return (await fetch(`${TG_API}/getChatMember?chat_id=${encodeURIComponent(chat)}&user_id=${user}`)).json();
+  },
 };
 
-// ---------- Messages ----------
-function helloLine(name){ return `👋 Hello ${esc(name)} 🇮🇳`; }
-const MAIN_TEXT = (name)=> `${helloLine(name)}\n\n🎯 <b>Main Menu</b>\nEarn via referrals & daily bonus —\nरिडीम करने के लिए <b>Withdraw</b> चुनें।`;
+const MAIN_KB = TG.kb([
+  [{ text: "💰 Balance", callback_data: "bal" }, { text: "🎁 Daily Bonus", callback_data: "bonus" }],
+  [{ text: "👥 Referral", callback_data: "ref" }, { text: "💵 Withdraw", callback_data: "wd" }],
+  [{ text: "🏆 Leaderboard", callback_data: "lb" }],
+  ...(ADMINS.length ? [[{ text: "🛠 Admin Panel", callback_data: "ad" }]] : []),
+]);
 
-const CHAN_TEXT = (name)=> `${helloLine(name)}\n\n🔐 <b>Join all channels to continue.</b>\nसबसे पहले सभी चैनल Join करें, फिर नीचे <b>Claim & Continue</b> दबाएँ।`;
+const BACK_KB = TG.kb([[{ text: "◀️ Back", callback_data: "back" }]]);
 
-// ---------- Withdraw ids ----------
-const kWdid = "wd:nextid";
-async function nextWdid(){ const r = await rcmd("INCR", kWdid); return Number(r.result); }
+/* ================== Text blocks ================== */
+const helloText = name =>
+  `👋 Hello ${esc(name)}!\n\n🎯 <b>Main Menu</b>\nEarn via referrals & daily bonus.\nकमाओ रेफ़रल से और बोनस से — रिडीम करो <b>Withdraw</b> से।`;
 
-// ---------- Request handler ----------
-export default async function handler(req){
-  const url = new URL(req.url);
-  // Set webhook helper
-  if (url.pathname.endsWith("/api/set-webhook")) {
-    const u = `${process.env.APP_URL}/api/telegram?secret=${encodeURIComponent(process.env.WEBHOOK_SECRET)}`;
-    const r = await fetch(`${TG_API}/setWebhook`, { method:"POST", headers:{ "content-type":"application/json" }, body:j({ url:u, allowed_updates:["message","callback_query"] })}).then(r=>r.json());
-    return new Response(j({ ok:true, set_to:u, telegram:r }), { headers:{ "content-type":"application/json" }});
-  }
+const gateText = name =>
+  `👋 Hello ${esc(name)} 🇮🇳\n\n🔐 <b>Join all channels to continue.</b>\nसबसे पहले सभी चैनल Join करें, फिर नीचे <b>Claim ✅</b> दबाएँ।`;
 
-  // Health
-  if (req.method === "GET") {
-    return new Response(j({ ok:true, hello:"telegram" }), { headers:{ "content-type":"application/json" }});
-  }
+const gateButtons = () => {
+  const rows = CHANNELS.map((_, i) => [{ text: `✅ Join Channel ${i + 1}`, url: `https://t.me/${CHANNELS[i].replace("@", "")}` }]);
+  rows.push([{ text: "✅ Claim", callback_data: "chkjoin" }]);
+  return TG.kb(rows);
+};
 
-  // Secret check
-  if (url.searchParams.get("secret") !== process.env.WEBHOOK_SECRET)
-    return new Response("unauthorized", { status:401 });
+const wdAskKB = TG.kb([
+  [{ text: "✉️ Gmail Redeem", callback_data: "wd_email" }, { text: "🏦 UPI Redeem", callback_data: "wd_upi" }],
+  [{ text: "◀️ Back", callback_data: "back" }],
+]);
 
-  // Telegram update
-  const update = await req.json().catch(()=> ({}));
-  try { return await handleUpdate(update); }
-  catch(e){
-    // swallow
-    return new Response("ok");
-  }
+/* ================== Data helpers ================== */
+async function getUser(id) {
+  const raw = await rget(`u:${id}`);
+  if (raw) return JSON.parse(raw);
+  const u = { id, name: "", balance: 0, refs: 0, email: "", upi: "", joinedOk: false, lastBonus: 0, invitedBy: 0, created: now() };
+  await rset(`u:${id}`, u);
+  // add to users set
+  let all = (await rget("users")) || "[]";
+  const arr = JSON.parse(all);
+  if (!arr.includes(id)) { arr.push(id); await rset("users", arr); }
+  return u;
+}
+async function saveUser(u) { return rset(`u:${u.id}`, u); }
+
+function maskEmail(e) {
+  if (!e || !e.includes("@")) return e;
+  const [a, b] = e.split("@");
+  const half = Math.ceil(a.length / 2);
+  return a.slice(0, half) + "*".repeat(a.length - half) + "@" + b;
+}
+function maskUPI(u) {
+  if (!u || !u.includes("@")) return u;
+  const [a, b] = u.split("@");
+  const left = Math.max(2, Math.ceil(a.length / 2));
+  return a.slice(0, left) + "*".repeat(Math.max(1, a.length - left)) + "@" + b;
 }
 
-function resOK(){ return new Response("ok"); }
+/* ================== Core ================== */
+export default async function handler(req) {
+  const url = new URL(req.url);
+  if (url.pathname.endsWith("/api/set-webhook")) {
+    const hook = `${APP_URL}/api/telegram?secret=${WEBHOOK_SECRET}`;
+    const r = await fetch(`${TG_API}/setWebhook`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: j({ url: hook, allowed_updates: ["message", "callback_query"] }),
+    }).then(r => r.json());
+    return new Response(j({ ok: true, set_to: hook, telegram: r }), { headers: { "content-type": "application/json" } });
+  }
+  if (req.method === "GET") return new Response(j({ ok: true, hello: "telegram" }), { headers: { "content-type": "application/json" } });
+  if (url.searchParams.get("secret") !== WEBHOOK_SECRET) return new Response("unauthorized", { status: 401 });
 
-// ---------- Core update ----------
-async function handleUpdate(upd){
-  const m = upd.message;
-  const cb = upd.callback_query;
+  const update = await req.json().catch(() => ({}));
+  try { await onUpdate(update); } catch (e) { console.log("ERR", e); }
+  return new Response("ok");
+}
+
+/* ================== Update router (single) ================== */
+async function onUpdate(upd) {
+  const m = upd.message, cb = upd.callback_query;
   const from = m?.from || cb?.from;
   const chat_id = m?.chat?.id || cb?.message?.chat?.id;
-  const msg = cb?.message;
-  const name = from?.first_name ? `${from.first_name}${from.last_name? " "+from.last_name:""}` : (from?.username? "@"+from.username : String(from?.id||"User"));
+  if (!from || !chat_id) return;
 
-  if (!from || !chat_id) return resOK();
+  // ensure user
+  let u = await getUser(from.id);
+  if (from.first_name && u.name !== from.first_name) { u.name = from.first_name; await saveUser(u); }
 
-  await ensureUser({ id: from.id, name }); await addIndex(from.id);
+  // Admin callback: approve / reject withdrawal
+  if (cb && /^wd:(approve|reject):\d+$/.test(cb.data) && isAdmin(from.id)) {
+    const [_, action, idStr] = cb.data.split(":");
+    const wid = +idStr;
+    const wd = JSON.parse((await rget(`wd:${wid}`)) || "null");
+    if (!wd) { await TG.answerCb(cb.id, { text: "Not found." }); return; }
+    if (wd.status !== "pending") { await TG.answerCb(cb.id, { text: "Already processed." }); return; }
 
-  // ---------- Admin text commands (run early) ----------
-  if (m?.text && isAdmin(from.id)) {
-    const text = m.text.trim();
-    const parsedTwoNums = (s)=> { const q=s.trim().match(/^(?:\/\w+)?\s*(\d+)\s+(\d+)$/); return q? {id:q[1], amt:parseInt(q[2],10)} : null; };
+    wd.status = action === "approve" ? "approved" : "rejected";
+    wd.processedAt = now();
+    await rset(`wd:${wid}`, wd);
 
-    if (/^\/add\b/i.test(text)) {
-      const p = parsedTwoNums(text);
-      if (!p){ await TG.send(chat_id, "❌ Format गलत है।\nउदाहरण: <code>/add 123456789 5000</code>", KB.back); return resOK(); }
-      await addCoins(p.id, p.amt);
-      await TG.send(chat_id, `✅ Added <b>${p.amt}</b> coins to <code>${p.id}</code>.`, KB.back);
-      return resOK();
+    // balance deduction only on approve (already reserved at request time)
+    const uu = await getUser(wd.user);
+    if (action === "reject") {
+      // refund
+      uu.balance += wd.amount;
     }
-    if (/^\/ded\b/i.test(text)) {
-      const p = parsedTwoNums(text);
-      if (!p){ await TG.send(chat_id, "❌ Format गलत है।\nउदाहरण: <code>/ded 123456789 500</code>", KB.back); return resOK(); }
-      await subCoins(p.id, p.amt);
-      await TG.send(chat_id, `✅ Deducted <b>${p.amt}</b> coins from <code>${p.id}</code>.`, KB.back);
-      return resOK();
+    await saveUser(uu);
+
+    // notify user
+    const ok = action === "approve";
+    if (ok) {
+      const dest = wd.kind === "email" ? `email: <b>${esc(wd.value)}</b>` : `UPI: <b>${esc(wd.value)}</b>`;
+      await TG.send(wd.user, `🎉 <b>Your withdrawal #${wid} has been APPROVED.</b>\nCheck your ${dest}.`, BACK_KB);
+      // post to proof channel
+      if (PROOF_CH) {
+        const masked = wd.kind === "email" ? maskEmail(wd.value) : maskUPI(wd.value);
+        const title = `✅ Withdrawal Paid`;
+        const text =
+          `<b>${title}</b>\nID: <b>${wid}</b>\nUser: ${uu.name ? esc(uu.name) : uu.id}\n` +
+          `${wd.kind === "email" ? `Email: <b>${esc(masked)}</b>` : `UPI: <b>${esc(masked)}</b>`}\n` +
+          `Amount: <b>${wd.amount}</b>`;
+        await TG.send(PROOF_CH, text);
+      }
+    } else {
+      await TG.send(wd.user, `❌ <b>Your withdrawal #${wid} was REJECTED.</b>\nAmount refunded.`, BACK_KB);
     }
-    if (/^\/setbal\b/i.test(text)) {
-      const p = parsedTwoNums(text);
-      if (!p){ await TG.send(chat_id, "❌ Format गलत है।\nउदाहरण: <code>/setbal 123456789 2500</code>", KB.back); return resOK(); }
-      await setBalance(p.id, p.amt);
-      await TG.send(chat_id, `✅ Balance set to <b>${p.amt}</b> for <code>${p.id}</code>.`, KB.back);
-      return resOK();
-    }
-    if (/^\/broadcast\b/i.test(text)) {
-      const msg = text.replace(/^\/broadcast\b/i,"").trim();
-      if (!msg){ await TG.send(chat_id, "📣 Use: <code>/broadcast your message…</code>", KB.back); return resOK(); }
-      const ids = await getAllUserIds(); let ok=0;
-      for (const uid of ids){ try{ await TG.send(uid, msg); ok++; }catch{} }
-      await TG.send(chat_id, `✅ Broadcast sent to <b>${ok}</b> users.`, KB.back);
-      return resOK();
-    }
+
+    // update admin card
+    await TG.edit(chat_id, cb.message.message_id,
+      `💼 <b>Withdrawal ${wid}</b>\nStatus: <b>${wd.status.toUpperCase()}</b>`);
+    await TG.answerCb(cb.id, { text: `Marked ${wd.status}` });
+    return;
   }
 
-  // ---------- Callback handling ----------
-  if (cb){
+  /* ---------- /start ---------- */
+  if (m?.text?.startsWith("/start")) {
+    // deep-link referral: /start 12345
+    const parts = m.text.trim().split(/\s+/);
+    if (parts[1] && !u.invitedBy && +parts[1] !== from.id) {
+      const inviterId = +parts[1];
+      u.invitedBy = inviterId;
+      await saveUser(u);
+      const inviter = await getUser(inviterId);
+      inviter.refs += 1;
+      inviter.balance += REF_BONUS;
+      await saveUser(inviter);
+      // inform inviter
+      await TG.send(inviterId, `🎉 <b>Great!</b> You got 1 referral. (+${REF_BONUS})`);
+    }
+
+    // show join gate if not yet verified in this session
+    if (!u.joinedOk) {
+      await TG.send(chat_id, gateText(u.name || "User"), gateButtons());
+      return;
+    }
+    await TG.send(chat_id, helloText(u.name || "User"), MAIN_KB);
+    return;
+  }
+
+  /* ---------- Callback buttons ---------- */
+  if (cb) {
     const data = cb.data;
 
-    if (data === "claim_joined"){
-      if (await needsJoin(from.id)) { await TG.answerCb(cb.id, { text:"❌ अभी भी कुछ channels joined नहीं हैं.", show_alert:true }); return resOK(); }
-      await TG.edit(chat_id, msg.message_id, "✅ Verified! Opening menu…");
-      await TG.send(chat_id, MAIN_TEXT(name), MAIN_KB);
-      return resOK();
-    }
-
-    if (data === "back_home"){ await TG.edit(chat_id, msg.message_id, MAIN_TEXT(name), MAIN_KB); return resOK(); }
-
-    if (data === "menu_channels"){
-      await TG.edit(chat_id, msg.message_id, CHAN_TEXT(name), joinKB());
-      return resOK();
-    }
-
-    if (data === "menu_proofs"){
-      const link = process.env.CHANNEL_2_URL || process.env.CHANNEL_1_URL || "https://t.me/";
-      await TG.edit(chat_id, msg.message_id, "🧾 Open Proof channel:", TG.kb([[{text:"🧾 Withdrawal Proofs ↗️", url:link}], [{text:"◀️ Back", callback_data:"back_home"}]]));
-      return resOK();
-    }
-
-    if (data === "menu_bal"){
-      const c = await getCoins(from.id);
-      await TG.edit(chat_id, msg.message_id, `💰 <b>Your balance:</b> <code>${c}</code> coins.`, TG.kb([[{text:"◀️ Back", callback_data:"back_home"}]]));
-      return resOK();
-    }
-
-    if (data === "menu_daily"){
-      const key = `u:${from.id}:daily:${new Date().toISOString().slice(0,10)}`;
-      const got = await rget(key);
-      if (got){ await TG.edit(chat_id, msg.message_id, "🎁 You already claimed today’s bonus.", KB.back); }
-      else { await rset(key, "1"); await rcmd("EXPIRE", key, 60*60*26); await addCoins(from.id, 100); await TG.edit(chat_id, msg.message_id, "🎉 Bonus added: <b>100</b> coins!", KB.back); }
-      return resOK();
-    }
-
-    if (data === "menu_ref"){
-      const botUser = "t.me/" + (upd?.my_chat_member?.chat?.username || ""); // best effort
-      const link = `https://t.me/${upd?.my_chat_member?.chat?.username || "your_bot"}?start=${from.id}`;
-      const refs = Number(await rget(kRefs(from.id))||0);
-      await TG.edit(chat_id, msg.message_id,
-        `👥 <b>Referral</b>\nInvite link:\n<code>${link}</code>\n\nYou have <b>${refs}</b> refs.`,
-        TG.kb([[{text:"◀️ Back", callback_data:"back_home"}]])
-      );
-      return resOK();
-    }
-
-    if (data === "menu_wd"){
-      await TG.edit(chat_id, msg.message_id, "💵 <b>Withdraw</b>\nSelect method / तरीका चुनें:", KB.wdMode);
-      return resOK();
-    }
-
-    if (data === "menu_lb"){
-      const arr = await zrevrange(ZREFS, 0, 9, true) || [];
-      const lines = ["🏆 <b>Leaderboard</b>"];
-      for (let i=0;i<arr.length;i+=2){
-        const uid = arr[i], score = arr[i+1];
-        const nm = await rget(kName(uid)) || uid;
-        lines.push(`${(i/2)+1}. ${esc(nm)} — <b>${score}</b> refs`);
+    if (data === "chkjoin") {
+      // verify all CHANNELS
+      let ok = true;
+      for (const ch of CHANNELS) {
+        const res = await TG.getChatMember(ch, from.id);
+        const st = res?.result?.status;
+        if (!["member", "administrator", "creator"].includes(st)) { ok = false; break; }
       }
-      if (lines.length===1) lines.push("No refs yet.");
-      await TG.edit(chat_id, msg.message_id, lines.join("\n"), KB.back);
-      return resOK();
+      if (!ok) {
+        await TG.answerCb(cb.id, { text: "❗ Join all channels first.", show_alert: true });
+        return;
+      }
+      u.joinedOk = true; await saveUser(u);
+      await TG.edit(chat_id, cb.message.message_id, "✅ All set! Opening main menu…");
+      await TG.send(chat_id, helloText(u.name || "User"), MAIN_KB);
+      return;
     }
 
-    // Withdraw path
-    if (data === "wd_email"){
-      await rset(kState(from.id), j({ t:"wd_email" }));
-      await TG.edit(chat_id, msg.message_id, "✉️ Please send your <b>email</b> and <b>amount</b>\nउदाहरण: <code>yourmail@gmail.com 1000</code>", KB.back);
-      return resOK();
-    }
-    if (data === "wd_upi"){
-      await rset(kState(from.id), j({ t:"wd_upi" }));
-      await TG.edit(chat_id, msg.message_id, "🏦 Please send your <b>UPI</b> and <b>amount</b>\nउदाहरण: <code>yourid@upi 1000</code>", KB.back);
-      return resOK();
+    if (data === "back") {
+      await TG.edit(chat_id, cb.message.message_id, helloText(u.name || "User"), MAIN_KB);
+      return;
     }
 
-    // Admin panel
-    if (data === "ad_home" && isAdmin(from.id)){
-      await TG.edit(chat_id, msg.message_id, "🛠 <b>Admin Panel</b>", KB.adHome);
-      return resOK();
-    }
-    if (data === "ad_add" && isAdmin(from.id)){
-      await rset(kState(from.id), j({t:"ad_add"}));
-      await TG.edit(chat_id, msg.message_id, "➕ Send: <code>userId amount</code>\nउदा.: <code>123456789 5000</code>", KB.back);
-      return resOK();
-    }
-    if (data === "ad_ded" && isAdmin(from.id)){
-      await rset(kState(from.id), j({t:"ad_ded"}));
-      await TG.edit(chat_id, msg.message_id, "➖ Send: <code>userId amount</code>", KB.back);
-      return resOK();
-    }
-    if (data === "ad_setbal" && isAdmin(from.id)){
-      await rset(kState(from.id), j({t:"ad_set"}));
-      await TG.edit(chat_id, msg.message_id, "🧮 Send: <code>userId amount</code>", KB.back);
-      return resOK();
-    }
-    if (data === "ad_bc" && isAdmin(from.id)){
-      await rset(kState(from.id), j({t:"ad_bc"}));
-      await TG.edit(chat_id, msg.message_id, "📣 Send broadcast message text.", KB.back);
-      return resOK();
+    if (data === "bal") {
+      await TG.edit(chat_id, cb.message.message_id, `💰 <b>Your balance:</b> <code>${u.balance}</code>`, TG.kb([[{ text: "◀️ Back", callback_data: "back" }]]));
+      return;
     }
 
-    return resOK();
+    if (data === "bonus") {
+      const today = new Date(); today.setHours(0, 0, 0, 0);
+      const start = Math.floor(today.getTime() / 1000);
+      if (u.lastBonus >= start) {
+        await TG.answerCb(cb.id, { text: "⏳ Bonus already claimed today.", show_alert: true });
+        return;
+      }
+      u.lastBonus = now(); u.balance += BONUS_PER_DAY; await saveUser(u);
+      await TG.edit(chat_id, cb.message.message_id, `🎁 Bonus added: <b>${BONUS_PER_DAY}</b>\n💰 Balance: <b>${u.balance}</b>`, BACK_KB);
+      return;
+    }
+
+    if (data === "ref") {
+      const link = `https://t.me/${(upd?.my_chat_member?.chat?.username) || ""}?start=${from.id}`;
+      await TG.edit(chat_id, cb.message.message_id,
+        `👥 <b>Your Referrals:</b> <b>${u.refs}</b>\n🔗 Invite link: <code>https://t.me/<your_bot_username>?start=${from.id}</code>\n(ऊपर अपने बॉट का यूज़रनेम भरें)`,
+        BACK_KB);
+      return;
+    }
+
+    if (data === "wd") {
+      await rset(`state:${from.id}`, j({ step: "choose_wd" }));
+      await TG.edit(chat_id, cb.message.message_id,
+        `💵 <b>Withdraw</b>\nएक विकल्प चुनें:\n• Gmail Redeem (code भेजेंगे)\n• UPI Redeem (direct transfer)\n\n➡️ फिर बॉट आपसे details माँगेगा।`,
+        wdAskKB);
+      return;
+    }
+
+    if (data === "wd_email" || data === "wd_upi") {
+      const kind = data === "wd_email" ? "email" : "upi";
+      await rset(`state:${from.id}`, j({ step: `wd_${kind}` }));
+      const msg =
+        kind === "email"
+          ? `✉️ <b>Send Gmail like:</b>\n<code>yourmail@gmail.com 120</code>\n(सिर्फ email और amount, slash नहीं)`
+          : `🏦 <b>Send UPI like:</b>\n<code>yourupi@bank 120</code>\n(सिर्फ upi और amount)`;
+      await TG.edit(chat_id, cb.message.message_id, msg, BACK_KB);
+      return;
+    }
+
+    if (data === "lb") {
+      const all = JSON.parse((await rget("users")) || "[]");
+      const enriched = [];
+      for (const id of all) {
+        const uu = await getUser(id);
+        enriched.push({ id, name: uu.name || String(id), refs: uu.refs || 0 });
+      }
+      enriched.sort((a, b) => b.refs - a.refs);
+      const top = enriched.slice(0, 10);
+      const lines = top.map((x, i) => `${i + 1}. ${esc(x.name)} - <b>${x.refs}</b> refs`).join("\n");
+      await TG.edit(chat_id, cb.message.message_id, `🏆 <b>Leaderboard</b>\n${lines || "No data"}`, BACK_KB);
+      return;
+    }
+
+    if (data === "ad" && isAdmin(from.id)) {
+      await TG.edit(chat_id, cb.message.message_id,
+        `🛠 <b>Admin Panel</b>\nCommands:\n• <code>/add userId amount</code>\n• <code>/sub userId amount</code>\n• <code>/bc your message</code>`,
+        BACK_KB);
+      return;
+    }
   }
 
-  // ---------- Message handling ----------
-  if (m?.text){
-    const text = m.text.trim();
+  /* ---------- Text message handling (states) ---------- */
+  if (m?.text) {
+    const txt = m.text.trim();
 
-    // Referral on /start param
-    if (text.startsWith("/start")){
-      // Join gate only on /start
-      if (await needsJoin(from.id)){
-        await TG.send(chat_id, CHAN_TEXT(name), joinKB()); return resOK();
-      }
-      // ref
-      const parts = text.split(" ");
-      if (parts[1]){
-        const ref = parts[1].trim();
-        if (ref && ref !== String(from.id)){
-          // credit only first time
-          const seenKey = `ref:seen:${from.id}`;
-          if (!(await rget(seenKey))){
-            await rset(seenKey, "1");
-            await incRef(ref);
-          }
-        }
-      }
-      await TG.send(chat_id, MAIN_TEXT(name), MAIN_KB);
-      return resOK();
+    // Admin commands
+    if (isAdmin(from.id) && /^\/(add|sub)\s+\d+\s+\d+$/.test(txt)) {
+      const [, cmd, uidStr, amtStr] = txt.match(/^\/(add|sub)\s+(\d+)\s+(\d+)$/);
+      const tgt = await getUser(+uidStr);
+      const amt = +amtStr;
+      tgt.balance += cmd === "add" ? amt : -amt;
+      if (tgt.balance < 0) tgt.balance = 0;
+      await saveUser(tgt);
+      await TG.send(chat_id, `✅ Done. User ${tgt.name || tgt.id} balance: <b>${tgt.balance}</b>`, BACK_KB);
+      return;
+    }
+    if (isAdmin(from.id) && txt.startsWith("/bc ")) {
+      const msg = txt.slice(4);
+      const all = JSON.parse((await rget("users")) || "[]");
+      for (const id of all) { await TG.send(id, `📣 <b>Broadcast:</b>\n${esc(msg)}`); }
+      await TG.send(chat_id, "✅ Broadcast sent.");
+      return;
     }
 
-    // If user simply sends email or upi + amount while in respective states OR directly
-    const stRaw = await rget(kState(from.id));
-    const st = stRaw ? JSON.parse(stRaw) : null;
-
-    // Admin state flows
-    if (st && isAdmin(from.id)){
-      const mm = text.match(/^(\d+)\s+(\d+)$/);
-      if ((st.t==="ad_add" || st.t==="ad_ded" || st.t==="ad_set") && !mm){
-        await TG.send(chat_id, "❌ Format गलत है।\nउदाहरण: <code>123456789 5000</code>", KB.back);
-        return resOK();
-      }
-      if (st.t==="ad_add"){
-        await addCoins(mm[1], parseInt(mm[2],10));
-        await rdel(kState(from.id));
-        await TG.send(chat_id, "✅ Done.", KB.back); return resOK();
-      }
-      if (st.t==="ad_ded"){
-        await subCoins(mm[1], parseInt(mm[2],10));
-        await rdel(kState(from.id));
-        await TG.send(chat_id, "✅ Done.", KB.back); return resOK();
-      }
-      if (st.t==="ad_set"){
-        await setBalance(mm[1], parseInt(mm[2],10));
-        await rdel(kState(from.id));
-        await TG.send(chat_id, "✅ Done.", KB.back); return resOK();
-      }
-      if (st.t==="ad_bc"){
-        const ids = await getAllUserIds(); let ok=0;
-        for (const uid of ids){ try{ await TG.send(uid, text); ok++; }catch{} }
-        await rdel(kState(from.id));
-        await TG.send(chat_id, `✅ Broadcast sent to <b>${ok}</b> users.`, KB.back); return resOK();
-      }
+    // Start (if user typed again)
+    if (txt === "/start") {
+      if (!u.joinedOk) { await TG.send(chat_id, gateText(u.name || "User"), gateButtons()); return; }
+      await TG.send(chat_id, helloText(u.name || "User"), MAIN_KB); return;
     }
 
-    // Withdraw states
-    if (st?.t === "wd_email" || st?.t==="wd_upi"){
-      const mm = text.match(/^(\S+)\s+(\d+)$/);
-      if (!mm){ await TG.send(chat_id, "❌ कृपया सही format भेजें।\nEmail/UPI और Amount —\n<code>your@gmail.com 1000</code> या <code>id@upi 1000</code>", KB.back); return resOK();}
-      const dest = mm[1], amt = parseInt(mm[2],10);
+    // State machine for withdraw details
+    const stateRaw = await rget(`state:${from.id}`);
+    const state = stateRaw ? JSON.parse(stateRaw) : null;
 
-      // Balance check
-      const bal = await getCoins(from.id);
-      if (bal < amt){ await TG.send(chat_id, "❌ Insufficient balance.", KB.back); return resOK(); }
+    if (state?.step === "wd_email" || state?.step === "wd_upi") {
+      // Expect: "<value> <amount>"
+      const m2 = txt.match(/^(\S+)\s+(\d+)$/);
+      if (!m2) { await TG.send(chat_id, "❌ Format गलत है। सही उदाहरण देखें।", BACK_KB); return; }
+      const value = m2[1]; const amount = +m2[2];
+      if (amount < MIN_WITHDRAW) { await TG.send(chat_id, `❗ Minimum withdraw <b>${MIN_WITHDRAW}</b> है।`, BACK_KB); return; }
+      if (u.balance < amount) { await TG.send(chat_id, `❗ Balance कम है। Your balance: <b>${u.balance}</b>`, BACK_KB); return; }
+      const kind = state.step === "wd_email" ? "email" : "upi";
 
-      const wdid = await nextWdid();
-      await subCoins(from.id, amt);
-      await rset(kWD(from.id), wdid);
-      if (st.t==="wd_email"){ await rset(kEmail(from.id), dest); await rdel(kUPI(from.id)); }
-      if (st.t==="wd_upi"){ await rset(kUPI(from.id), dest); await rdel(kEmail(from.id)); }
-      await rdel(kState(from.id));
+      // reserve balance
+      u.balance -= amount; if (kind === "email") u.email = value; else u.upi = value;
+      await saveUser(u);
 
-      // Notify user (masked)
-      const lineEmail = st.t==="wd_email" ? `Email: <b>${esc(maskEmail(dest))}</b>` : `Email: —`;
-      const lineUPI   = st.t==="wd_upi"   ? `UPI: <b>${esc(maskUPI(dest))}</b>`   : `UPI: —`;
+      const wid = +(await r("INCR", "wd:seq"));
+      const rec = { id: wid, user: from.id, name: u.name || String(from.id), kind, value, amount, status: "pending", created: now() };
+      await rset(`wd:${wid}`, rec);
+      await rdel(`state:${from.id}`);
+
+      // user receipt
       await TG.send(chat_id,
-        `✅ <b>Withdraw request received.</b>\nID: <b>${wdid}</b>\n${lineEmail}\n${lineUPI}\nAmount: <b>${amt}</b>`,
-        KB.back
-      );
+        `✅ <b>Withdraw request received.</b>\nID: <b>${wid}</b>\n${kind === "email" ? "Email" : "UPI"}: <b>${esc(value)}</b>\nAmount: <b>${amount}</b>`,
+        BACK_KB);
 
-      // Admin card (full data)
-      const adText =
-        `💸 <b>Withdraw Request</b>\n`+
-        `ID: <b>${wdid}</b>\n`+
-        `User: <code>${from.id}</code> (${esc(name)})\n`+
-        `Email: ${esc(await rget(kEmail(from.id))||"-")}\n`+
-        `UPI: ${esc(await rget(kUPI(from.id))||"-")}\n`+
-        `Amount: <b>${amt}</b>`;
-      const adminKb = TG.kb([
-        [{text:"✅ Approve", callback_data:`ad_wd_ok:${wdid}:${from.id}:${amt}`},
-         {text:"❌ Reject",  callback_data:`ad_wd_no:${wdid}:${from.id}:${amt}`}]
+      // admin card
+      const adminText =
+        `💸 <b>Withdraw Request</b>\nID: <b>${wid}</b>\nUser: ${from.id} (${esc(u.name || "User")})\n` +
+        `${kind === "email" ? "Email" : "UPI"}: <b>${esc(value)}</b>\nAmount: <b>${amount}</b>`;
+      const adminKB = TG.kb([
+        [{ text: "✅ Approve", callback_data: `wd:approve:${wid}` }, { text: "❌ Reject", callback_data: `wd:reject:${wid}` }],
       ]);
-      for (const ad of ADMINS){ try{ await TG.send(ad, adText, adminKb); }catch{} }
+      for (const admin of ADMINS) { await TG.send(admin, adminText, adminKB); }
 
-      return resOK();
+      return;
     }
 
-    // Direct email/upi + amount (without entering mode) — convenience
-    {
-      const mm = text.match(/^(\S+@\S+|\S+@\S+)\s+(\d+)$/);
-      if (mm){
-        // Put into mode depending on pattern
-        const dest = mm[1], amt = parseInt(mm[2],10);
-        const isMail = /\S+@\S+\.\S+/.test(dest) && dest.includes(".");
-        await rset(kState(from.id), j({ t: isMail ? "wd_email" : "wd_upi" }));
-        // re-use state handler by echoing same text
-        upd.callback_query = undefined;
-        return await handleUpdate({ message: { ...m, text: text }, ...pick(upd, "update_id") });
-      }
+    // If user pressed back keyword
+    if (/^back$/i.test(txt)) {
+      await TG.send(chat_id, helloText(u.name || "User"), MAIN_KB);
+      return;
     }
 
-    // Fallback
-    await TG.send(chat_id, `${helloLine(name)}\n✅ Ping reply OK`);
-    return resOK();
+    // default echo
+    await TG.send(chat_id, `👋 Hello ${esc(u.name || "User")}!\nType /start to open menu.`, MAIN_KB);
   }
-
-  return resOK();
-}
-
-// ---------- Admin approve/reject callbacks (post message) ----------
-async function handleUpdate(update){
-  // This wrapper allows us to intercept already defined above; keep it to avoid duplication.
-  return await coreHandle(update);
-}
-async function coreHandle(upd){
-  const m = upd.message;
-  const cb = upd.callback_query;
-  const from = m?.from || cb?.from;
-  const chat_id = m?.chat?.id || cb?.message?.chat?.id;
-  const msg = cb?.message;
-  const name = from?.first_name ? `${from.first_name}${from.last_name? " "+from.last_name:""}` : (from?.username? "@"+from.username : String(from?.id||"User"));
-
-  // intercept admin approve/reject
-  if (cb && /^ad_wd_/.test(cb.data) && isAdmin(from.id)){
-    const [tag, act, wdid, uid, amt] = cb.data.split(/[:]/); // tag includes "ad_wd"
-    const email = await rget(kEmail(uid)) || "-";
-    const upi   = await rget(kUPI(uid)) || "-";
-
-    if (act==="ok"){
-      await TG.answerCb(cb.id, { text:"Approved!" });
-      // Notify user
-      const maskE = email !== "-" ? maskEmail(email) : "-";
-      const maskU = upi   !== "-" ? maskUPI(upi) : "-";
-      await TG.send(uid, `🎉 Your withdrawal #${wdid} has been <b>APPROVED</b>.\nEmail: <b>${esc(maskE)}</b>\nUPI: <b>${esc(maskU)}</b>.`);
-      // Post to proofs (full)
-      if (process.env.PROOF_CHANNEL_ID){
-        const txt =
-          `🟩 <b>Withdrawal Paid</b>\n`+
-          `ID: <b>${wdid}</b>\n`+
-          `User: <code>${uid}</code> (${esc(await rget(kName(uid))||uid)})\n`+
-          `Email: ${esc(email)}\n`+
-          `UPI: ${esc(upi)}\n`+
-          `Amount: <b>${amt}</b>`;
-        try{ await TG.send(process.env.PROOF_CHANNEL_ID, txt); }catch{}
-      }
-      await TG.edit(chat_id, msg.message_id, "✅ Approved & posted.");
-      return resOK();
-    }else{
-      await TG.answerCb(cb.id, { text:"Rejected!" });
-      // refund
-      await addCoins(uid, parseInt(amt,10));
-      await TG.send(uid, `❗ Your withdrawal #${wdid} was <b>REJECTED</b>. Amount refunded.`);
-      await TG.edit(chat_id, msg.message_id, "❌ Rejected & refunded.");
-      return resOK();
-    }
-  }
-
-  // otherwise fall back to main handler above
-  return await _mainHandler(upd);
-}
-
-// to avoid hoist issues, split the earlier handleUpdate into _mainHandler
-async function _mainHandler(upd){
-  // re-run the earlier function body (we already wrote it above)
-  // To keep this file compact, call the already-declared function from top scope.
-  return await (async function inner(u){ /* noop: replaced at build */ })(upd);
 }
