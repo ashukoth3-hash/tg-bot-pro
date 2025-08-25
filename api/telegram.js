@@ -99,12 +99,8 @@ const mainRows = [
   [{ text: "💰 Balance", callback_data: "bal" }, { text: "🎁 Daily Bonus", callback_data: "bonus" }],
   [{ text: "👥 Referral", callback_data: "ref" }, { text: "💵 Withdraw", callback_data: "wd" }],
 ];
-
 // 📄 Proofs link button (only if URL is set)
-if (PROOF_CH_URL) {
-  mainRows.push([{ text: "📄 Proofs", url: PROOF_CH_URL }]);
-}
-
+if (PROOF_CH_URL) mainRows.push([{ text: "📄 Proofs", url: PROOF_CH_URL }]);
 mainRows.push([{ text: "🏆 Leaderboard", callback_data: "lb" }]);
 if (ADMINS.length) mainRows.push([{ text: "🛠 Admin Panel", callback_data: "ad" }]);
 
@@ -207,12 +203,13 @@ async function onUpdate(upd) {
     }
     await saveUser(uu);
 
-    // notify user + post proofs
+    // notify user
     const ok = action === "approve";
     if (ok) {
       const dest = wd.kind === "email" ? `email: <b>${esc(wd.value)}</b>` : `UPI: <b>${esc(wd.value)}</b>`;
       await TG.send(wd.user, `🎉 <b>Your withdrawal #${wid} has been APPROVED.</b>\nCheck your ${dest}.`, BACK_KB);
 
+      // post to proof channel (supports ID or @username)
       if (PROOF_TARGET) {
         const masked = wd.kind === "email" ? maskEmail(wd.value) : maskUPI(wd.value);
         const title = `✅ Withdrawal Paid`;
@@ -245,6 +242,10 @@ async function onUpdate(upd) {
       inviter.refs += 1;
       inviter.balance += REF_BONUS;
       await saveUser(inviter);
+
+      // 👇 Optimized Leaderboard: update ZSET
+      await r("ZINCRBY", "leaderboard", 1, inviterId);
+
       // inform inviter
       await TG.send(inviterId, `🎉 <b>Great!</b> You got 1 referral. (+${fmt(REF_BONUS)})`);
     }
@@ -286,12 +287,7 @@ async function onUpdate(upd) {
     }
 
     if (data === "bal") {
-      await TG.edit(
-        chat_id,
-        cb.message.message_id,
-        `💰 <b>Your balance:</b> <code>${fmt(u.balance)}</code>`,
-        TG.kb([[{ text: "◀️ Back", callback_data: "back" }]])
-      );
+      await TG.edit(chat_id, cb.message.message_id, `💰 <b>Your balance:</b> <code>${fmt(u.balance)}</code>`, TG.kb([[{ text: "◀️ Back", callback_data: "back" }]]));
       return;
     }
 
@@ -302,15 +298,8 @@ async function onUpdate(upd) {
         await TG.answerCb(cb.id, { text: "⏳ Bonus already claimed today.", show_alert: true });
         return;
       }
-      u.lastBonus = now();
-      u.balance = Number((u.balance + BONUS_PER_DAY).toFixed(2));
-      await saveUser(u);
-      await TG.edit(
-        chat_id,
-        cb.message.message_id,
-        `🎁 Bonus added: <b>${fmt(BONUS_PER_DAY)}</b>\n💰 Balance: <b>${fmt(u.balance)}</b>`,
-        BACK_KB
-      );
+      u.lastBonus = now(); u.balance = Number((u.balance + BONUS_PER_DAY).toFixed(2)); await saveUser(u);
+      await TG.edit(chat_id, cb.message.message_id, `🎁 Bonus added: <b>${fmt(BONUS_PER_DAY)}</b>\n💰 Balance: <b>${fmt(u.balance)}</b>`, BACK_KB);
       return;
     }
 
@@ -319,23 +308,17 @@ async function onUpdate(upd) {
       const link = uname
         ? `https://t.me/${uname}?start=${from.id}`
         : `https://t.me/<your_bot_username>?start=${from.id}`;
-      await TG.edit(
-        chat_id,
-        cb.message.message_id,
+      await TG.edit(chat_id, cb.message.message_id,
         `👥 <b>Your Referrals:</b> <b>${u.refs}</b>\n🔗 Invite link: <code>${esc(link)}</code>`,
-        BACK_KB
-      );
+        BACK_KB);
       return;
     }
 
     if (data === "wd") {
       await rset(`state:${from.id}`, j({ step: "choose_wd" }));
-      await TG.edit(
-        chat_id,
-        cb.message.message_id,
+      await TG.edit(chat_id, cb.message.message_id,
         `💵 <b>Withdraw</b>\nएक विकल्प चुनें:\n• Gmail Redeem (code भेजेंगे)\n• UPI Redeem (direct transfer)\n\n➡️ फिर बॉट आपसे details माँगेगा।`,
-        wdAskKB
-      );
+        wdAskKB);
       return;
     }
 
@@ -351,26 +334,26 @@ async function onUpdate(upd) {
     }
 
     if (data === "lb") {
-      const all = JSON.parse((await rget("users")) || "[]");
-      const enriched = [];
-      for (const id of all) {
-        const uu = await getUser(id);
-        enriched.push({ id, name: uu.name || String(id), refs: uu.refs || 0 });
+      // 👇 Direct from Redis sorted set (Top 3)
+      const res = await r("ZREVRANGE", "leaderboard", 0, 2, "WITHSCORES");
+      let lines = "No data yet";
+      if (res && res.length) {
+        lines = "";
+        for (let i = 0; i < res.length; i += 2) {
+          const uid = res[i];
+          const refs = res[i + 1];
+          const uu = await getUser(uid);
+          lines += `${i/2 + 1}. ${esc(uu.name || "User")} - <b>${refs}</b> refs\n`;
+        }
       }
-      enriched.sort((a, b) => b.refs - a.refs);
-      const top = enriched.slice(0, 3);
-      const lines = top.map((x, i) => `${i + 1}. ${esc(x.name)} - <b>${x.refs}</b> refs`).join("\n");
-      await TG.edit(chat_id, cb.message.message_id, `🏆 <b>Leaderboard</b>\n${lines || "No data"}`, BACK_KB);
+      await TG.edit(chat_id, cb.message.message_id, `🏆 <b>Leaderboard (Top 3)</b>\n${lines}`, BACK_KB);
       return;
     }
 
     if (data === "ad" && isAdmin(from.id)) {
-      await TG.edit(
-        chat_id,
-        cb.message.message_id,
+      await TG.edit(chat_id, cb.message.message_id,
         `🛠 <b>Admin Panel</b>\nCommands:\n• <code>/add userId amount</code>\n• <code>/sub userId amount</code>\n• <code>/bc your message</code>`,
-        BACK_KB
-      );
+        BACK_KB);
       return;
     }
   }
@@ -428,11 +411,9 @@ async function onUpdate(upd) {
       await rdel(`state:${from.id}`);
 
       // user receipt
-      await TG.send(
-        chat_id,
+      await TG.send(chat_id,
         `✅ <b>Withdraw request received.</b>\nID: <b>${wid}</b>\n${kind === "email" ? "Email" : "UPI"}: <b>${esc(value)}</b>\nAmount: <b>${fmt(amount)}</b>`,
-        BACK_KB
-      );
+        BACK_KB);
 
       // admin card
       const adminText =
@@ -455,4 +436,4 @@ async function onUpdate(upd) {
     // default echo
     await TG.send(chat_id, `👋 Hello ${esc(u.name || "User")}!\nType /start to open menu.`, MAIN_KB);
   }
-}
+      }
