@@ -358,7 +358,7 @@ async function onUpdate(upd) {
         enriched.push({ id, name: uu.name || String(id), refs: uu.refs || 0 });
       }
       enriched.sort((a, b) => b.refs - a.refs);
-      const top = enriched.slice(0, 10);
+      const top = enriched.slice(0, 3);
       const lines = top.map((x, i) => `${i + 1}. ${esc(x.name)} - <b>${x.refs}</b> refs`).join("\n");
       await TG.edit(chat_id, cb.message.message_id, `🏆 <b>Leaderboard</b>\n${lines || "No data"}`, BACK_KB);
       return;
