@@ -20,21 +20,20 @@ const PROOF_CH = process.env.PROOF_CHANNEL_ID
   ? +process.env.PROOF_CHANNEL_ID
   : null;
 
-/* 👇 optional username for proof channel; and unified target */
+/* Optional username for proof channel; unified target */
 const PROOF_CH_UN = process.env.PROOF_CHANNEL_USERNAME || null; // e.g. @Withdrawal_Proofsj
 const PROOF_TARGET = PROOF_CH || PROOF_CH_UN || null;
 
-/* 👇 NEW: URL for button to open proofs channel */
-const PROOF_CH_URL = process.env.PROOF_CHANNEL_URL || "";
-
-const BONUS_PER_DAY = +(process.env.BONUS_PER_DAY || 10);
-const REF_BONUS = +(process.env.REF_BONUS || 20);
-const MIN_WITHDRAW = +(process.env.MIN_WITHDRAW || 100);
+/* 👉 Coins → Rupees (defaults) */
+const BONUS_PER_DAY = parseFloat(process.env.BONUS_PER_DAY || "0.10");   // ₹0.10
+const REF_BONUS    = parseFloat(process.env.REF_BONUS    || "0.50");     // ₹0.50
+const MIN_WITHDRAW = parseFloat(process.env.MIN_WITHDRAW || "10");       // ₹10.00
 
 const j = v => JSON.stringify(v);
 const now = () => Math.floor(Date.now() / 1000);
 const esc = (s = "") => s.replace(/[<>&]/g, m => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[m]));
 const isAdmin = id => ADMINS.includes(+id);
+const fmt = n => `₹${Number(n).toFixed(2)}`;
 
 /* ===== Upstash Redis REST ===== */
 const RURL = process.env.UPSTASH_REDIS_REST_URL;
@@ -86,7 +85,7 @@ const TG = {
   },
 };
 
-/* 👇 bot username resolver (referral link fix) */
+/* Bot username resolver (referral link) */
 const BOT_USERNAME_ENV = (process.env.BOT_USERNAME || "").replace("@", "");
 async function getBotUsername() {
   if (BOT_USERNAME_ENV) return BOT_USERNAME_ENV;
@@ -94,21 +93,12 @@ async function getBotUsername() {
   return info?.result?.username || "";
 }
 
-/* ================== Keyboards ================== */
-const mainRows = [
+const MAIN_KB = TG.kb([
   [{ text: "💰 Balance", callback_data: "bal" }, { text: "🎁 Daily Bonus", callback_data: "bonus" }],
   [{ text: "👥 Referral", callback_data: "ref" }, { text: "💵 Withdraw", callback_data: "wd" }],
-];
-
-/* 👇 ONLY NEW ROW: Proof channel button via URL */
-if (PROOF_CH_URL) {
-  mainRows.push([{ text: "📄 Proofs", url: PROOF_CH_URL }]);
-}
-
-mainRows.push([{ text: "🏆 Leaderboard", callback_data: "lb" }]);
-if (ADMINS.length) mainRows.push([{ text: "🛠 Admin Panel", callback_data: "ad" }]);
-
-const MAIN_KB = TG.kb(mainRows);
+  [{ text: "🏆 Leaderboard", callback_data: "lb" }],
+  ...(ADMINS.length ? [[{ text: "🛠 Admin Panel", callback_data: "ad" }]] : []),
+]);
 
 const BACK_KB = TG.kb([[{ text: "◀️ Back", callback_data: "back" }]]);
 
@@ -221,7 +211,7 @@ async function onUpdate(upd) {
         const text =
           `<b>${title}</b>\nID: <b>${wid}</b>\nUser: ${uu.name ? esc(uu.name) : uu.id}\n` +
           `${wd.kind === "email" ? `Email: <b>${esc(masked)}</b>` : `UPI: <b>${esc(masked)}</b>`}\n` +
-          `Amount: <b>${wd.amount}</b>`;
+          `Amount: <b>${fmt(wd.amount)}</b>`;
         await TG.send(PROOF_TARGET, text);
       }
     } else {
@@ -248,7 +238,7 @@ async function onUpdate(upd) {
       inviter.balance += REF_BONUS;
       await saveUser(inviter);
       // inform inviter
-      await TG.send(inviterId, `🎉 <b>Great!</b> You got 1 referral. (+${REF_BONUS})`);
+      await TG.send(inviterId, `🎉 <b>Great!</b> You got 1 referral. (+${fmt(REF_BONUS)})`);
     }
 
     // show join gate if not yet verified in this session
@@ -288,7 +278,7 @@ async function onUpdate(upd) {
     }
 
     if (data === "bal") {
-      await TG.edit(chat_id, cb.message.message_id, `💰 <b>Your balance:</b> <code>${u.balance}</code>`, TG.kb([[{ text: "◀️ Back", callback_data: "back" }]]));
+      await TG.edit(chat_id, cb.message.message_id, `💰 <b>Your balance:</b> <code>${fmt(u.balance)}</code>`, TG.kb([[{ text: "◀️ Back", callback_data: "back" }]]));
       return;
     }
 
@@ -299,8 +289,8 @@ async function onUpdate(upd) {
         await TG.answerCb(cb.id, { text: "⏳ Bonus already claimed today.", show_alert: true });
         return;
       }
-      u.lastBonus = now(); u.balance += BONUS_PER_DAY; await saveUser(u);
-      await TG.edit(chat_id, cb.message.message_id, `🎁 Bonus added: <b>${BONUS_PER_DAY}</b>\n💰 Balance: <b>${u.balance}</b>`, BACK_KB);
+      u.lastBonus = now(); u.balance = Number((u.balance + BONUS_PER_DAY).toFixed(2)); await saveUser(u);
+      await TG.edit(chat_id, cb.message.message_id, `🎁 Bonus added: <b>${fmt(BONUS_PER_DAY)}</b>\n💰 Balance: <b>${fmt(u.balance)}</b>`, BACK_KB);
       return;
     }
 
@@ -328,8 +318,8 @@ async function onUpdate(upd) {
       await rset(`state:${from.id}`, j({ step: `wd_${kind}` }));
       const msg =
         kind === "email"
-          ? `✉️ <b>Send Gmail like:</b>\n<code>yourmail@gmail.com 120</code>\n(सिर्फ email और amount, slash नहीं)`
-          : `🏦 <b>Send UPI like:</b>\n<code>yourupi@bank 120</code>\n(सिर्फ upi और amount)`;
+          ? `✉️ <b>Send Gmail like:</b>\n<code>yourmail@gmail.com 120</code>\n(सिर्फ email और amount, slash नहीं)\n\nAmount ₹ में भेजें, decimal allowed (जैसे 10.50).`
+          : `🏦 <b>Send UPI like:</b>\n<code>yourupi@bank 120</code>\n(सिर्फ upi और amount)\n\nAmount ₹ में भेजें, decimal allowed (जैसे 10.50).`;
       await TG.edit(chat_id, cb.message.message_id, msg, BACK_KB);
       return;
     }
@@ -360,15 +350,15 @@ async function onUpdate(upd) {
   if (m?.text) {
     const txt = m.text.trim();
 
-    // Admin commands (unchanged)
-    if (isAdmin(from.id) && /^\/(add|sub)\s+\d+\s+\d+$/.test(txt)) {
-      const [, cmd, uidStr, amtStr] = txt.match(/^\/(add|sub)\s+(\d+)\s+(\d+)$/);
+    // Admin commands (now allow decimals)
+    if (isAdmin(from.id) && /^\/(add|sub)\s+\d+\s+\d+(?:\.\d{1,2})?$/.test(txt)) {
+      const [, cmd, uidStr, amtStr] = txt.match(/^\/(add|sub)\s+(\d+)\s+(\d+(?:\.\d{1,2})?)$/);
       const tgt = await getUser(+uidStr);
-      const amt = +amtStr;
-      tgt.balance += cmd === "add" ? amt : -amt;
+      const amt = parseFloat(amtStr);
+      tgt.balance = Number((tgt.balance + (cmd === "add" ? amt : -amt)).toFixed(2));
       if (tgt.balance < 0) tgt.balance = 0;
       await saveUser(tgt);
-      await TG.send(chat_id, `✅ Done. User ${tgt.name || tgt.id} balance: <b>${tgt.balance}</b>`, BACK_KB);
+      await TG.send(chat_id, `✅ Done. User ${tgt.name || tgt.id} balance: <b>${fmt(tgt.balance)}</b>`, BACK_KB);
       return;
     }
     if (isAdmin(from.id) && txt.startsWith("/bc ")) {
@@ -390,16 +380,17 @@ async function onUpdate(upd) {
     const state = stateRaw ? JSON.parse(stateRaw) : null;
 
     if (state?.step === "wd_email" || state?.step === "wd_upi") {
-      // Expect: "<value> <amount>"
-      const m2 = txt.match(/^(\S+)\s+(\d+)$/);
+      // Expect: "<value> <amount>" ; amount decimal allowed
+      const m2 = txt.match(/^(\S+)\s+(\d+(?:\.\d{1,2})?)$/);
       if (!m2) { await TG.send(chat_id, "❌ Format गलत है। सही उदाहरण देखें।", BACK_KB); return; }
-      const value = m2[1]; const amount = +m2[2];
-      if (amount < MIN_WITHDRAW) { await TG.send(chat_id, `❗ Minimum withdraw <b>${MIN_WITHDRAW}</b> है।`, BACK_KB); return; }
-      if (u.balance < amount) { await TG.send(chat_id, `❗ Balance कम है। Your balance: <b>${u.balance}</b>`, BACK_KB); return; }
+      const value = m2[1]; const amount = parseFloat(m2[2]);
+      if (amount < MIN_WITHDRAW) { await TG.send(chat_id, `❗ Minimum withdraw <b>${fmt(MIN_WITHDRAW)}</b> है।`, BACK_KB); return; }
+      if (u.balance < amount) { await TG.send(chat_id, `❗ Balance कम है। Your balance: <b>${fmt(u.balance)}</b>`, BACK_KB); return; }
       const kind = state.step === "wd_email" ? "email" : "upi";
 
       // reserve balance
-      u.balance -= amount; if (kind === "email") u.email = value; else u.upi = value;
+      u.balance = Number((u.balance - amount).toFixed(2));
+      if (kind === "email") u.email = value; else u.upi = value;
       await saveUser(u);
 
       const wid = +(await r("INCR", "wd:seq"));
@@ -409,13 +400,13 @@ async function onUpdate(upd) {
 
       // user receipt
       await TG.send(chat_id,
-        `✅ <b>Withdraw request received.</b>\nID: <b>${wid}</b>\n${kind === "email" ? "Email" : "UPI"}: <b>${esc(value)}</b>\nAmount: <b>${amount}</b>`,
+        `✅ <b>Withdraw request received.</b>\nID: <b>${wid}</b>\n${kind === "email" ? "Email" : "UPI"}: <b>${esc(value)}</b>\nAmount: <b>${fmt(amount)}</b>`,
         BACK_KB);
 
       // admin card
       const adminText =
         `💸 <b>Withdraw Request</b>\nID: <b>${wid}</b>\nUser: ${from.id} (${esc(u.name || "User")})\n` +
-        `${kind === "email" ? "Email" : "UPI"}: <b>${esc(value)}</b>\nAmount: <b>${amount}</b>`;
+        `${kind === "email" ? "Email" : "UPI"}: <b>${esc(value)}</b>\nAmount: <b>${fmt(amount)}</b>`;
       const adminKB = TG.kb([
         [{ text: "✅ Approve", callback_data: `wd:approve:${wid}` }, { text: "❌ Reject", callback_data: `wd:reject:${wid}` }],
       ]);
